@@ -276,25 +276,31 @@ uv run ruff check src/forma
 
 ## Architecture
 
+### Request Pipeline
+
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         Forma Proxy                              │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  Request ──► Extract ──► Retrieve ──► Augment ──► Forward       │
-│                                      │                          │
-│                                      ▼                          │
-│                               Background Store                  │
-│                                                                  │
-├───────────────────────┬─────────────────────────────────────────┤
-│       CogDB           │              ChromaDB                   │
-│   (Graph Storage)     │          (Vector Storage)               │
-├───────────────────────┼─────────────────────────────────────────┤
-│ - Entities            │ - Facts (semantic search)               │
-│ - Relationships       │ - Recipes (semantic search)             │
-│ - Graph traversal     │ - Cosine similarity                     │
-└───────────────────────┴─────────────────────────────────────────┘
+Request → Extract → Retrieve → Augment → Forward → Response
+                         │
+                         ▼
+                  Background Store
 ```
+
+### Storage Backend
+
+| Component | Type | Purpose |
+|-----------|------|---------|
+| **CogDB** | Graph | Entities and relationships (graph traversal) |
+| **ChromaDB** | Vector | Facts and recipes (semantic similarity search) |
+
+### Data Flow
+
+| Stage | Input | Output |
+|-------|-------|--------|
+| **Extract** | Messages | Entities, relationships, facts, recipes, queries |
+| **Retrieve** | Queries | Context from CogDB + ChromaDB |
+| **Augment** | Context + Prompt | Augmented user message |
+| **Forward** | Augmented request | Upstream API response |
+| **Store** | Extracted data | Persisted to CogDB + ChromaDB (async) |
 
 ## License
 
