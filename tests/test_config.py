@@ -7,7 +7,7 @@ from forma.config import Settings
 
 def test_default_settings():
     """Test default settings values."""
-    settings = Settings()
+    settings = Settings(_env_file=None)
     assert settings.host == "0.0.0.0"
     assert settings.port == 8000
     assert settings.debug is False

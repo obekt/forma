@@ -1,6 +1,7 @@
 """FastAPI application entry point."""
 
 import asyncio
+import contextlib
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -31,6 +32,21 @@ LOGS_DIR = Path(__file__).parent.parent.parent / "logs"
 proxy: OpenAIProxy
 extractor: Extractor
 storage: Storage
+_storage_lock = asyncio.Lock()
+
+
+_retrieval_log_file: Any = None
+
+
+def _ensure_retrieval_log() -> Any:
+    """Open persistent retrieval log file handle."""
+    global _retrieval_log_file
+    if _retrieval_log_file is None:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        _retrieval_log_file = open(  # noqa: SIM115
+            LOGS_DIR / "retrievals.jsonl", "a", encoding="utf-8"
+        )
+    return _retrieval_log_file
 
 
 def _log_context_retrieval(
@@ -41,7 +57,6 @@ def _log_context_retrieval(
     augmented_prompt: str | None,
 ) -> None:
     """Log context retrieval to file for debugging."""
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
     log_entry = {
         "timestamp": datetime.utcnow().isoformat(),
         "queries": {
@@ -58,10 +73,10 @@ def _log_context_retrieval(
         "scores": context.get("scores", {}),
         "augmented_prompt": augmented_prompt,
     }
-    log_file = LOGS_DIR / "retrievals.jsonl"
     try:
-        with open(log_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(log_entry) + "\n")
+        f = _ensure_retrieval_log()
+        f.write(json.dumps(log_entry) + "\n")
+        f.flush()
         logger.debug(
             f"Logged retrieval: {len(context.get('relationships', []))} relationships, "
             f"{len(context.get('facts', []))} facts, {len(context.get('recipes', []))} recipes, "
@@ -78,26 +93,28 @@ async def _store_extraction_background(
     recipes: list[dict[str, Any]],
 ) -> None:
     """Background task to store extracted data."""
-    try:
-        if entities or relationships or facts or recipes:
-            entities_count, relationships_count, facts_count, recipes_count = (
-                storage.store_extraction(entities, relationships, facts, recipes)
-            )
-            logger.info(
-                f"Stored (background): {entities_count} entities, {relationships_count} relationships, "
-                f"{facts_count} facts, {recipes_count} recipes"
-            )
-    except Exception as e:
-        logger.error(f"Background storage error: {e}")
+    async with _storage_lock:
+        try:
+            if entities or relationships or facts or recipes:
+                entities_count, relationships_count, facts_count, recipes_count = (
+                    storage.store_extraction(entities, relationships, facts, recipes)
+                )
+                logger.info(
+                    f"Stored (background): {entities_count} entities, "
+                    f"{relationships_count} relationships, "
+                    f"{facts_count} facts, {recipes_count} recipes"
+                )
+        except Exception as e:
+            logger.error(f"Background storage error: {e}")
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> Any:
     """Manage application lifespan."""
     global proxy, extractor, storage
     settings = get_settings()
     proxy = OpenAIProxy(settings)
-    extractor = Extractor(settings)
+    extractor = Extractor(settings, proxy=proxy)
     storage = Storage(
         chromadb_host=settings.chromadb_host,
         chromadb_port=settings.chromadb_port,
@@ -108,24 +125,32 @@ async def lifespan(app: FastAPI):
     logger.info(f"Forma proxy starting - upstream: {settings.upstream_base_url}")
     if settings.embedding_base_url:
         logger.info(
-            f"Embedding endpoint: {settings.embedding_base_url} (model: {settings.embedding_model_name})"
+            f"Embedding endpoint: {settings.embedding_base_url} "
+            f"(model: {settings.embedding_model_name})"
         )
     else:
         logger.info("Embeddings will use upstream endpoint")
     if settings.extractor_base_url:
         logger.info(
-            f"Extraction endpoint: {settings.extractor_base_url} (model: {settings.extractor_model_name})"
+            f"Extraction endpoint: {settings.extractor_base_url} "
+            f"(model: {settings.extractor_model_name})"
         )
     else:
         logger.info("Extraction will use upstream endpoint")
     # Log storage stats
     stats = storage.get_stats()
     logger.info(
-        f"Storage: ChromaDB facts={stats['chromadb']['facts']}, recipes={stats['chromadb']['recipes']}, "
+        f"Storage: ChromaDB facts={stats['chromadb']['facts']}, "
+        f"recipes={stats['chromadb']['recipes']}, "
         f"CogDB entities={stats['cogdb']['entities']}"
     )
     yield
     logger.info("Forma proxy shutting down")
+    await proxy.close()
+    extractor.close()
+    if _retrieval_log_file is not None:
+        with contextlib.suppress(Exception):
+            _retrieval_log_file.close()
 
 
 app = FastAPI(
@@ -252,19 +277,43 @@ async def chat_completions(request: Request) -> dict[str, Any] | StreamingRespon
     # Step 4: Forward to upstream
     response = await proxy.chat_completions(payload)
 
-    # Step 5: Store extracted data in background (fire-and-forget)
-    if extraction_result and (
-        extraction_result.entities
-        or extraction_result.relationships
-        or extraction_result.facts
-        or extraction_result.recipes
-    ):
+    # Step 5: Extract facts from assistant response (non-streaming only)
+    assistant_facts: list[dict[str, Any]] = []
+    if isinstance(response, dict) and extractor.settings.extractor_model_name:
+        try:
+            assistant_content = ""
+            for choice in response.get("choices", []):
+                msg = choice.get("message", {})
+                if msg.get("role") == "assistant":
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        assistant_content = content
+                    break
+            if assistant_content:
+                logger.info("Extracting facts from assistant response...")
+                assistant_result = await extractor.extract_from_text_async(
+                    assistant_content
+                )
+                if assistant_result.facts:
+                    logger.info(
+                        f"Extracted {len(assistant_result.facts)} facts from assistant response"
+                    )
+                    assistant_facts = assistant_result.facts
+        except Exception as e:
+            logger.error(f"Assistant response extraction error: {e}")
+
+    # Step 6: Store all extracted data in background (fire-and-forget)
+    entities = extraction_result.entities if extraction_result else []
+    relationships = extraction_result.relationships if extraction_result else []
+    facts = (extraction_result.facts if extraction_result else []) + assistant_facts
+    recipes = extraction_result.recipes if extraction_result else []
+    if entities or relationships or facts or recipes:
         asyncio.create_task(
             _store_extraction_background(
-                extraction_result.entities,
-                extraction_result.relationships,
-                extraction_result.facts,
-                extraction_result.recipes,
+                entities,
+                relationships,
+                facts,
+                recipes,
             )
         )
 
@@ -291,7 +340,9 @@ async def clear_storage() -> dict[str, Any]:
     """Clear all stored data from ChromaDB and CogDB."""
     result = storage.clear_all()
     logger.info(
-        f"Storage cleared: facts={result['cleared']['facts']}, recipes={result['cleared']['recipes']}, entities={result['cleared']['entities']}"
+        f"Storage cleared: facts={result['cleared']['facts']}, "
+        f"recipes={result['cleared']['recipes']}, "
+        f"entities={result['cleared']['entities']}"
     )
     return result
 

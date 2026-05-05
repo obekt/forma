@@ -1,8 +1,8 @@
 """Extraction system for entities, relationships, and facts."""
 
+import contextlib
 import json
 import logging
-import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -48,7 +48,9 @@ class ExtractionResult:
         try:
             # Parse entities - look for lines with (type) pattern
             entities_section = re.search(
-                r"=== ENTITIES ===\n(.*?)(?==== RELATIONSHIPS ===|=== FACTS ===|=== RECIPES ===|=== ENTITIES_QUERY ===|=== END ===|$)",
+                r"=== ENTITIES ===\n(.*?)"
+                r"(?==== RELATIONSHIPS ===|=== FACTS ===|=== RECIPES ===|"
+                r"=== ENTITIES_QUERY ===|=== END ===|$)",
                 response,
                 re.DOTALL,
             )
@@ -75,7 +77,9 @@ class ExtractionResult:
 
             # Parse relationships - look for lines with -> pattern
             rels_section = re.search(
-                r"=== RELATIONSHIPS ===\n(.*?)(?==== FACTS ===|=== RECIPES ===|=== ENTITIES_QUERY ===|=== END ===|$)",
+                r"=== RELATIONSHIPS ===\n(.*?)"
+                r"(?==== FACTS ===|=== RECIPES ===|=== ENTITIES_QUERY ===|"
+                r"=== END ===|$)",
                 response,
                 re.DOTALL,
             )
@@ -90,12 +94,14 @@ class ExtractionResult:
                     # Format: Subject -> predicate -> Object confidence: 0.9
                     # Need to capture object before confidence suffix
                     match = re.match(
-                        r"[\[\(]?([^\[\]\(\)]+)[\]\)]?\s*->\s*(.+?)\s*->\s*[\[\(]?([^\[\]\(\)]+)[\]\)]?\s*(?:confidence:\s*([\d.]+))?",
+                        r"[\[\(]?([^\[\]\(\)]+)[\]\)]?\s*->\s*(.+?)\s*->\s*"
+                        r"[\[\(]?([^\[\]\(\)]+)[\]\)]?\s*(?:confidence:\s*([\d.]+))?",
                         line,
                     )
                     if match:
                         confidence = float(match.group(4)) if match.group(4) else 0.9
-                        # Clean predicate and object - remove trailing confidence if accidentally captured
+                        # Clean predicate and object
+                        # remove trailing confidence if accidentally captured
                         predicate = match.group(2).strip()
                         object = match.group(3).strip()
                         # Remove any "confidence: X.X" that might be in predicate/object
@@ -173,7 +179,9 @@ class ExtractionResult:
 
             # Parse recipes - procedural knowledge as plain text
             recipes_section = re.search(
-                r"=== RECIPES ===\n(.*?)(?==== ENTITIES_QUERY ===|=== FACT_QUERY ===|=== RECIPE_QUERY ===|=== END ===|$)",
+                r"=== RECIPES ===\n(.*?)"
+                r"(?==== ENTITIES_QUERY ===|=== FACT_QUERY ===|"
+                r"=== RECIPE_QUERY ===|=== END ===|$)",
                 response,
                 re.DOTALL,
             )
@@ -208,7 +216,8 @@ class ExtractionResult:
 
             # Parse entities query - list of entity names to query
             entities_query_section = re.search(
-                r"=== ENTITIES_QUERY ===\n(.*?)(?==== FACT_QUERY ===|=== RECIPE_QUERY ===|=== END ===|$)",
+                r"=== ENTITIES_QUERY ===\n(.*?)"
+                r"(?==== FACT_QUERY ===|=== RECIPE_QUERY ===|=== END ===|$)",
                 response,
                 re.DOTALL,
             )
@@ -283,9 +292,13 @@ class ExtractionResult:
 class Extractor:
     """Handles extraction of entities, relationships, and facts from text."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, proxy: Any = None) -> None:
         self.settings = settings
+        self.proxy = proxy
         self._ensure_logs_dir()
+        self._log_file = open(  # noqa: SIM115
+            LOGS_DIR / "extractions.jsonl", "a", encoding="utf-8"
+        )
 
     def _load_prompt_template(self) -> str:
         """Load the extraction prompt template from file (called each time for live updates)."""
@@ -327,8 +340,8 @@ class Extractor:
         # Build prompt
         messages = self.build_extraction_prompt(text)
 
-        # Call extraction LLM
-        proxy = OpenAIProxy(self.settings)
+        # Call extraction LLM (reuse global proxy if available)
+        proxy = self.proxy or OpenAIProxy(self.settings)
         response = await proxy.extract(
             messages=messages,
             max_tokens=512,  # Lower since no reasoning output
@@ -344,6 +357,11 @@ class Extractor:
 
         return result
 
+    def close(self) -> None:
+        """Close the persistent log file handle."""
+        with contextlib.suppress(Exception):
+            self._log_file.close()
+
     def _log_extraction(self, text: str, result: ExtractionResult) -> None:
         """Log extraction result to file."""
         log_entry = {
@@ -353,12 +371,13 @@ class Extractor:
             "extraction": result.to_dict(),
         }
 
-        log_file = LOGS_DIR / "extractions.jsonl"
         try:
-            with open(log_file, "a", encoding="utf-8") as f:
-                f.write(json.dumps(log_entry) + "\n")
+            self._log_file.write(json.dumps(log_entry) + "\n")
+            self._log_file.flush()
             logger.debug(
-                f"Logged extraction: {len(result.entities)} entities, {len(result.relationships)} relationships, {len(result.facts)} facts"
+                f"Logged extraction: {len(result.entities)} entities, "
+                f"{len(result.relationships)} relationships, "
+                f"{len(result.facts)} facts"
             )
         except Exception as e:
             logger.error(f"Failed to log extraction: {e}")
@@ -375,23 +394,25 @@ class Extractor:
         return asyncio.run(self.extract_from_messages_async(messages))
 
     async def extract_from_messages_async(self, messages: list[dict[str, str]]) -> ExtractionResult:
-        """Async extraction from all user messages."""
-        # Collect all user messages
-        user_texts = []
+        """Async extraction from all user and assistant messages."""
+        texts = []
         for msg in messages:
-            if msg.get("role") == "user":
+            role = msg.get("role")
+            if role in ("user", "assistant"):
                 content = msg.get("content", "")
                 if isinstance(content, str):
-                    user_texts.append(content)
+                    prefix = "User:" if role == "user" else "Assistant:"
+                    texts.append(f"{prefix}\n{content}")
                 elif isinstance(content, list):
                     # Handle multi-modal content (text parts)
                     for part in content:
                         if isinstance(part, dict) and part.get("type") == "text":
-                            user_texts.append(part.get("text", ""))
+                            prefix = "User:" if role == "user" else "Assistant:"
+                            texts.append(f"{prefix}\n{part.get('text', '')}")
 
-        if not user_texts:
+        if not texts:
             return ExtractionResult("")
 
-        # Combine all user messages for extraction
-        combined_text = "\n\n---\n\n".join(user_texts)
+        # Combine all messages for extraction
+        combined_text = "\n\n---\n\n".join(texts)
         return await self.extract_from_text_async(combined_text)

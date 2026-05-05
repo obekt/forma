@@ -3,8 +3,9 @@
 import logging
 import math
 import os
-from datetime import datetime, timezone
-from typing import Any
+from collections.abc import Mapping
+from datetime import UTC, datetime
+from typing import Any, cast
 
 import chromadb
 from cog import config as cog_config
@@ -62,7 +63,7 @@ class Storage:
             # Calculate age in hours
             if timestamp:
                 ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-                now = datetime.now(timezone.utc)
+                now = datetime.now(UTC)
                 age_hours = (now - ts).total_seconds() / 3600
             else:
                 age_hours = 0
@@ -86,7 +87,7 @@ class Storage:
             # Calculate age in hours
             if timestamp:
                 ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-                now = datetime.now(timezone.utc)
+                now = datetime.now(UTC)
                 age_hours = (now - ts).total_seconds() / 3600
             else:
                 age_hours = 0
@@ -117,20 +118,30 @@ class Storage:
 
     def _create_chroma_client(
         self, host: str, port: int, persist_directory: str
-    ) -> chromadb.ClientAPI:
+    ) -> Any:
         """Create ChromaDB client."""
         if persist_directory:
             logger.info(f"Using persistent ChromaDB at: {persist_directory}")
             return chromadb.PersistentClient(path=persist_directory)
-        else:
+        # Try server mode first, fall back to in-memory ephemeral
+        try:
             logger.info(f"Connecting to ChromaDB server at {host}:{port}")
             return chromadb.HttpClient(host=host, port=port)
+        except Exception:
+            logger.warning(
+                f"Could not connect to ChromaDB server at {host}:{port}, "
+                "falling back to in-memory ephemeral client"
+            )
+            return chromadb.EphemeralClient()
 
-    def _get_or_create_collection(self, name: str) -> chromadb.Collection:
+    def _get_or_create_collection(self, name: str) -> Any:
         """Get or create a ChromaDB collection with cosine similarity."""
-        return self.chroma_client.get_or_create_collection(
-            name=name,
-            metadata={"hnsw:space": "cosine"},
+        return cast(
+            Any,
+            self.chroma_client.get_or_create_collection(
+                name=name,
+                metadata={"hnsw:space": "cosine"},
+            ),
         )
 
     def _create_cogdb_graph(self, graph_name: str, path_prefix: str) -> Graph:
@@ -277,8 +288,9 @@ class Storage:
                     query_texts=[statement],
                     n_results=1,
                 )
-                if existing.get("distances") and existing["distances"][0]:
-                    min_distance = existing["distances"][0][0]
+                distances = existing.get("distances")
+                if distances and distances[0]:
+                    min_distance = distances[0][0]
                     if min_distance < duplicate_threshold:
                         # Near-duplicate found - skip
                         logger.debug(f"Skipping duplicate fact: {statement[:50]}...")
@@ -301,7 +313,7 @@ class Storage:
         if documents:
             self.facts_collection.add(
                 documents=documents,
-                metadatas=metadatas,
+                metadatas=cast(list[Mapping[str, Any]], metadatas),
                 ids=ids,
             )
             logger.info(f"Stored {len(documents)} facts to ChromaDB")
@@ -343,8 +355,9 @@ class Storage:
                     query_texts=[description],
                     n_results=1,
                 )
-                if existing.get("distances") and existing["distances"][0]:
-                    min_distance = existing["distances"][0][0]
+                distances = existing.get("distances")
+                if distances and distances[0]:
+                    min_distance = distances[0][0]
                     if min_distance < duplicate_threshold:
                         # Near-duplicate found - skip
                         logger.debug(f"Skipping duplicate recipe: {description[:50]}...")
@@ -367,7 +380,7 @@ class Storage:
         if documents:
             self.recipes_collection.add(
                 documents=documents,
-                metadatas=metadatas,
+                metadatas=cast(list[Mapping[str, Any]], metadatas),
                 ids=ids,
             )
             logger.info(f"Stored {len(documents)} recipes to ChromaDB")
@@ -403,19 +416,19 @@ class Storage:
             n_results=n_results,
         )
 
-        formatted = []
-        if results.get("documents") and results["documents"][0]:
-            for i, doc in enumerate(results["documents"][0]):
+        formatted: list[dict[str, Any]] = []
+        documents = results.get("documents")
+        metadatas = results.get("metadatas")
+        distances = results.get("distances")
+        ids = results.get("ids")
+        if documents and documents[0]:
+            for i, doc in enumerate(documents[0]):
                 formatted.append(
                     {
                         "document": doc,
-                        "metadata": results.get("metadatas", [[]])[0][i]
-                        if results.get("metadatas")
-                        else {},
-                        "distance": results.get("distances", [[]])[0][i]
-                        if results.get("distances")
-                        else None,
-                        "id": results.get("ids", [[]])[0][i] if results.get("ids") else None,
+                        "metadata": metadatas[0][i] if metadatas else {},
+                        "distance": distances[0][i] if distances else None,
+                        "id": ids[0][i] if ids else None,
                     }
                 )
 
@@ -432,19 +445,19 @@ class Storage:
             n_results=n_results,
         )
 
-        formatted = []
-        if results.get("documents") and results["documents"][0]:
-            for i, doc in enumerate(results["documents"][0]):
+        formatted: list[dict[str, Any]] = []
+        documents = results.get("documents")
+        metadatas = results.get("metadatas")
+        distances = results.get("distances")
+        ids = results.get("ids")
+        if documents and documents[0]:
+            for i, doc in enumerate(documents[0]):
                 formatted.append(
                     {
                         "document": doc,
-                        "metadata": results.get("metadatas", [[]])[0][i]
-                        if results.get("metadatas")
-                        else {},
-                        "distance": results.get("distances", [[]])[0][i]
-                        if results.get("distances")
-                        else None,
-                        "id": results.get("ids", [[]])[0][i] if results.get("ids") else None,
+                        "metadata": metadatas[0][i] if metadatas else {},
+                        "distance": distances[0][i] if distances else None,
+                        "id": ids[0][i] if ids else None,
                     }
                 )
 
@@ -668,7 +681,7 @@ class Storage:
 
         Returns dict with 'relationships', 'facts', 'recipes', 'tokens_used', 'scores' lists.
         """
-        all_items = []  # Pool of all scored items
+        all_items: list[dict[str, Any]] = []  # Pool of all scored items
 
         # Query CogDB for entity relationships
         for entity in entities_queries:
@@ -780,7 +793,11 @@ class Storage:
         for i, item in enumerate(all_items):
             # Create unique key for each type
             if item["type"] == "relationship":
-                key = f"rel:{item['data']['subject']}|{item['data']['predicate']}|{item['data']['object']}"
+                key = (
+                    f"rel:{item['data']['subject']}|"
+                    f"{item['data']['predicate']}|"
+                    f"{item['data']['object']}"
+                )
             elif item["type"] == "fact":
                 key = f"fact:{item['data']['statement']}"
             elif item["type"] == "recipe":
@@ -806,12 +823,15 @@ class Storage:
         relationships = []
         facts = []
         recipes = []
-        scores = {"relationships": [], "facts": [], "recipes": []}
+        scores: dict[str, list[float]] = {"relationships": [], "facts": [], "recipes": []}
         tokens_used = 0
 
         # Reserve tokens for headers
         header_tokens = self._estimate_tokens(
-            "Relevant context from memory:\nKnown relationships:\nKnown facts:\nKnown procedures:\n\n"
+            "Relevant context from memory:\n"
+            "Known relationships:\n"
+            "Known facts:\n"
+            "Known procedures:\n\n"
         )
         tokens_used += header_tokens
 
@@ -831,7 +851,8 @@ class Storage:
                 scores["recipes"].append(item["score"])
 
         logger.info(
-            f"Retrieved {len(relationships)} relationships, {len(facts)} facts, {len(recipes)} recipes "
+            f"Retrieved {len(relationships)} relationships, "
+            f"{len(facts)} facts, {len(recipes)} recipes "
             f"using {tokens_used}/{token_budget} tokens"
         )
 
