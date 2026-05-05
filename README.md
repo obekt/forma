@@ -4,7 +4,7 @@ Autonomous Cognitive Proxy and Hybrid RAG System
 
 ## Overview
 
-Forma is an OpenAI-compatible proxy that augments conversations with retrieved context from a hybrid memory system. It automatically extracts entities, facts, and procedural knowledge from conversations, stores them in dual storage (graph + vector), and retrieves relevant context to augment future queries.
+Forma is an OpenAI-compatible proxy that augments conversations with retrieved context from a hybrid memory system. It automatically extracts entities, facts, and procedural knowledge from conversations, stores them in GrafitoDB (SQLite-backed graph + vector database), and retrieves relevant context to augment future queries.
 
 ### How It Works
 
@@ -17,10 +17,10 @@ For each chat completion request, Forma executes this pipeline:
    - Procedural knowledge (recipes/how-to guides)
    - Queries for retrieval
 
-2. **Retrieve** - Uses extracted queries to fetch relevant context from storage:
-   - Entity relationships from CogDB (graph database)
-   - Facts from ChromaDB (vector search)
-   - Recipes from ChromaDB (vector search)
+2. **Retrieve** - Uses extracted queries to fetch relevant context from GrafitoDB:
+   - Entity relationships (graph traversal)
+   - Facts (semantic similarity search)
+   - Recipes (semantic similarity search)
 
 3. **Augment** - Injects retrieved context into the prompt, giving the model access to information from previous conversations that may have been lost due to context window limits
 
@@ -30,21 +30,29 @@ For each chat completion request, Forma executes this pipeline:
 
 ### Storage Architecture
 
-Forma uses dual storage for different data types:
+Forma uses **GrafitoDB** - a SQLite-backed database that combines graph and vector storage in a single file:
 
 | Data Type | Storage | Why |
 |-----------|---------|-----|
-| Entities & Relationships | CogDB (Graph) | Efficient traversal of entity connections |
-| Facts & Recipes | ChromaDB (Vector) | Semantic similarity search |
+| Entities & Relationships | Graph (GrafitoDB) | Efficient traversal of entity connections |
+| Facts & Recipes | Vector Index (GrafitoDB) | Semantic similarity search |
+
+**Benefits of GrafitoDB:**
+- Single SQLite file - minimal file descriptor usage
+- No separate ChromaDB server required
+- Built-in SentenceTransformer embeddings
+- Local model caching for fast startup
 
 ### Retrieval Scoring
 
 Context items are ranked by a composite score:
 
-- **ChromaDB (facts, recipes)**: `confidence × similarity × time_decay`
-- **CogDB (relationships)**: `confidence × time_decay`
+```
+score = confidence × similarity × time_decay
+```
 
-Time decay uses exponential decay (30-day half-life by default), prioritizing recent information.
+- **Similarity**: Vector distance (1 - distance for semantic search)
+- **Time decay**: Exponential decay (30-day half-life by default), prioritizing recent information
 
 ## Quick Start
 
@@ -69,9 +77,14 @@ cp .env.example .env
 uv run forma
 # Or directly:
 uv run python -m forma.main
+
+# Or with nohup for background operation:
+nohup .venv/bin/python -m forma.main > forma.log 2>&1 &
 ```
 
 The server runs at `http://localhost:8000` by default.
+
+**Note**: On first startup, Forma will download the embedding model (`all-MiniLM-L6-v2`, ~90MB) to `./models/`. Subsequent starts load from cache - no network requests.
 
 ## Configuration
 
@@ -96,17 +109,6 @@ The OpenAI-compatible API that Forma proxies to:
 | `UPSTREAM_TIMEOUT` | `300.0` | Request timeout in seconds |
 | `MODEL_MAPPING` | `""` | Map local model names to upstream (format: `local:upstream,local2:upstream2`) |
 
-### Embedding Endpoint (Optional)
-
-Separate endpoint for embeddings (e.g., LM Studio with local embedding model):
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `EMBEDDING_BASE_URL` | `""` | Embedding endpoint URL (empty = use upstream) |
-| `EMBEDDING_API_KEY` | `""` | API key for embedding endpoint |
-| `EMBEDDING_MODEL_NAME` | `""` | Default embedding model |
-| `EMBEDDING_TIMEOUT` | `60.0` | Embedding request timeout |
-
 ### Extraction LLM (Optional)
 
 LLM used internally for extracting entities/facts/recipes:
@@ -118,15 +120,18 @@ LLM used internally for extracting entities/facts/recipes:
 | `EXTRACTOR_MODEL_NAME` | `""` | Model for extraction tasks |
 | `EXTRACTOR_TIMEOUT` | `120.0` | Extraction timeout (may need time for complex extraction) |
 
-### Storage
+### GrafitoDB Storage
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CHROMADB_HOST` | `localhost` | ChromaDB server host (used only if persist_directory is empty) |
-| `CHROMADB_PORT` | `8001` | ChromaDB server port (used only if persist_directory is empty) |
-| `CHROMADB_PERSIST_DIRECTORY` | `""` | Path for persistent ChromaDB (empty = in-memory or server mode) |
-| `COGDB_HOME` | `forma_graph` | CogDB graph name |
-| `COGDB_PATH_PREFIX` | `./cog_data` | CogDB storage directory |
+| `GRAFITODB_PATH` | `./grafito_data/forma.db` | SQLite database file path |
+| `GRAFITODB_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | SentenceTransformer model for embeddings |
+| `GRAFITODB_VECTOR_DIM` | `384` | Embedding dimension (model-specific) |
+| `GRAFITODB_MODEL_CACHE_PATH` | `./models` | Local cache for embedding model |
+
+**Note**: Embedding dimension must match the model:
+- `all-MiniLM-L6-v2`: 384 dimensions
+- `all-mpnet-base-v2`: 768 dimensions
 
 ### Example: LM Studio + OpenAI
 
@@ -135,10 +140,7 @@ LLM used internally for extracting entities/facts/recipes:
 UPSTREAM_BASE_URL=https://api.openai.com/v1
 UPSTREAM_API_KEY=sk-your-key
 
-# Use LM Studio for embeddings and extraction (no auth needed)
-EMBEDDING_BASE_URL=http://localhost:1234/v1
-EMBEDDING_MODEL_NAME=text-embedding-all-minilm-l6-v2-embedding
-
+# Use LM Studio for extraction (no auth needed)
 EXTRACTOR_BASE_URL=http://localhost:1234/v1
 EXTRACTOR_MODEL_NAME=gemma-4-e4b-it
 ```
@@ -149,15 +151,12 @@ EXTRACTOR_MODEL_NAME=gemma-4-e4b-it
 UPSTREAM_BASE_URL=http://localhost:1234/v1
 UPSTREAM_API_KEY=
 
-EMBEDDING_BASE_URL=http://localhost:1234/v1
-EMBEDDING_MODEL_NAME=text-embedding-all-minilm-l6-v2-embedding
-
 EXTRACTOR_BASE_URL=http://localhost:1234/v1
 EXTRACTOR_MODEL_NAME=smollm3-3b-128k
 
-# Persistent storage (embedded mode - port ignored)
-CHROMADB_PERSIST_DIRECTORY=./chroma_data
-COGDB_PATH_PREFIX=./cog_data
+# GrafitoDB defaults work well for local setup
+GRAFITODB_PATH=./grafito_data/forma.db
+GRAFITODB_MODEL_CACHE_PATH=./models
 ```
 
 ## Usage
@@ -194,13 +193,14 @@ response = client.chat.completions.create(
 | `GET /v1/models` | List available models |
 | `POST /v1/chat/completions` | Chat completions (supports streaming) |
 | `POST /v1/completions` | Legacy completions |
-| `POST /v1/embeddings` | Create embeddings |
+
+**Note**: The `/v1/embeddings` endpoint is not provided - embeddings are generated internally using SentenceTransformer.
 
 ### Admin Endpoints
 
 | Endpoint | Description |
 |----------|-------------|
-| `POST /admin/clear` | Clear all stored data (ChromaDB + CogDB) |
+| `POST /admin/clear` | Clear all stored data from GrafitoDB |
 | `GET /admin/stats` | Get storage statistics (facts, recipes, entities counts) |
 
 Example:
@@ -224,6 +224,22 @@ Forma uses a structured extraction prompt to extract:
 - **Queries**: Natural language queries for retrieval
 
 The extraction prompt is located at `src/forma/prompts/extraction.txt` and can be customized.
+
+## Model Caching
+
+Forma caches the SentenceTransformer embedding model locally:
+
+- **First startup**: Downloads model to `./models/{model_name}/` (~90MB for `all-MiniLM-L6-v2`)
+- **Subsequent starts**: Loads from local cache - no HuggingFace network requests
+
+To use a different embedding model:
+
+```env
+GRAFITODB_EMBEDDING_MODEL=all-mpnet-base-v2
+GRAFITODB_VECTOR_DIM=768
+```
+
+The models directory (`./models/`) is tracked in git but model files are ignored via `.gitignore`.
 
 ## Benchmarks
 
@@ -280,27 +296,31 @@ uv run ruff check src/forma
 
 ```
 Request → Extract → Retrieve → Augment → Forward → Response
-                                                   ↓
-                                            Background Store
-                                            (async, fire-and-forget)
+                                                    ↓
+                                             Background Store
+                                             (async, fire-and-forget)
 ```
 
 ### Storage Backend
 
 | Component | Type | Purpose |
 |-----------|------|---------|
-| **CogDB** | Graph | Entities and relationships (graph traversal) |
-| **ChromaDB** | Vector | Facts and recipes (semantic similarity search) |
+| **GrafitoDB** | SQLite + Graph + Vector | Single-file database for all storage |
+
+GrafitoDB provides:
+- **Graph storage**: Entities and relationships with Cypher query support
+- **Vector indexes**: Facts and recipes with semantic similarity search
+- **SentenceTransformer embeddings**: Built-in embedding function with local caching
 
 ### Data Flow
 
 | Stage | Input | Output |
 |-------|-------|--------|
 | **Extract** | Messages | Entities, relationships, facts, recipes, queries |
-| **Retrieve** | Queries | Context from CogDB + ChromaDB |
+| **Retrieve** | Queries | Context from GrafitoDB (graph + vector) |
 | **Augment** | Context + Prompt | Augmented user message |
 | **Forward** | Augmented request | Upstream API response |
-| **Store** | Extracted data | Persisted to CogDB + ChromaDB (async) |
+| **Store** | Extracted data | Persisted to GrafitoDB (async) |
 
 ## License
 

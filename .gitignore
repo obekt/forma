@@ -67,6 +67,14 @@ chroma_data/
 # CogDB local storage
 cog_data/
 
+# GrafitoDB local storage
+grafito_data/
+
+# Local models (downloaded from HuggingFace)
+# Track the folder but ignore the model files inside
+models/*
+!models/.gitkeep
+
 # Benchmark outputs
 benchmarks/**/results/
 benchmarks/**/__pycache__/

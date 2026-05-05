@@ -116,23 +116,12 @@ async def lifespan(app: FastAPI) -> Any:
     proxy = OpenAIProxy(settings)
     extractor = Extractor(settings, proxy=proxy)
     storage = Storage(
-        chromadb_host=settings.chromadb_host,
-        chromadb_port=settings.chromadb_port,
-        chromadb_persist_directory=settings.chromadb_persist_directory,
-        cogdb_home=settings.cogdb_home,
-        cogdb_path_prefix=settings.cogdb_path_prefix,
-        chromadb_max_file_handles=settings.chromadb_max_file_handles,
-        cogdb_index_capacity=settings.cogdb_index_capacity,
-        cogdb_l2_cache_size=settings.cogdb_l2_cache_size,
+        grafitodb_path=settings.grafitodb_path,
+        grafitodb_embedding_model=settings.grafitodb_embedding_model,
+        grafitodb_vector_dim=settings.grafitodb_vector_dim,
+        grafitodb_model_cache_path=settings.grafitodb_model_cache_path,
     )
     logger.info(f"Forma proxy starting - upstream: {settings.upstream_base_url}")
-    if settings.embedding_base_url:
-        logger.info(
-            f"Embedding endpoint: {settings.embedding_base_url} "
-            f"(model: {settings.embedding_model_name})"
-        )
-    else:
-        logger.info("Embeddings will use upstream endpoint")
     if settings.extractor_base_url:
         logger.info(
             f"Extraction endpoint: {settings.extractor_base_url} "
@@ -143,9 +132,10 @@ async def lifespan(app: FastAPI) -> Any:
     # Log storage stats
     stats = storage.get_stats()
     logger.info(
-        f"Storage: ChromaDB facts={stats['chromadb']['facts']}, "
-        f"recipes={stats['chromadb']['recipes']}, "
-        f"CogDB entities={stats['cogdb']['entities']}"
+        f"Storage: GrafitoDB entities={stats['grafitodb']['entities']}, "
+        f"relationships={stats['grafitodb']['relationships']}, "
+        f"facts={stats['grafitodb']['facts']}, "
+        f"recipes={stats['grafitodb']['recipes']}"
     )
     yield
     logger.info("Forma proxy shutting down")
@@ -329,29 +319,23 @@ async def completions(request: Request) -> dict[str, Any] | StreamingResponse:
     return await proxy.completions(payload)
 
 
-@app.post("/v1/embeddings")
-async def embeddings(request: Request) -> dict[str, Any]:
-    """Create embeddings."""
-    payload = await request.json()
-    return await proxy.embeddings(payload)
-
-
 # Admin endpoints
 @app.post("/admin/clear")
 async def clear_storage() -> dict[str, Any]:
-    """Clear all stored data from ChromaDB and CogDB."""
+    """Clear all stored data from GrafitoDB."""
     result = storage.clear_all()
     logger.info(
         f"Storage cleared: facts={result['cleared']['facts']}, "
         f"recipes={result['cleared']['recipes']}, "
-        f"entities={result['cleared']['entities']}"
+        f"entities={result['cleared']['entities']}, "
+        f"relationships={result['cleared']['relationships']}"
     )
     return result
 
 
 @app.get("/admin/stats")
 async def get_storage_stats() -> dict[str, Any]:
-    """Get storage statistics for ChromaDB and CogDB."""
+    """Get storage statistics for GrafitoDB."""
     return storage.get_stats()
 
 

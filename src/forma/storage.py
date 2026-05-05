@@ -1,71 +1,147 @@
-"""Storage for extracted data: ChromaDB for facts/recipes, CogDB for entities/relationships."""
+"""Storage for extracted data: GrafitoDB (SQLite-backed graph + vector database)."""
 
 import logging
 import math
 import os
-from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import Any, cast
+from pathlib import Path
+from typing import Any
 
-import chromadb
-from chromadb.config import Settings as ChromaSettings
-from cog import config as cog_config
-from cog.torque import CogConfig, Graph
+from grafito import GrafitoDatabase
+from grafito.embedding_functions import SentenceTransformerEmbeddingFunction
+from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
 
-# ChromaDB collection names
-FACTS_COLLECTION = "facts_v1"
-RECIPES_COLLECTION = "recipes_v1"
+# Vector index names for semantic search
+FACTS_VECTOR_INDEX = "facts_index"
+RECIPES_VECTOR_INDEX = "recipes_index"
 
 # Token estimation: roughly 4 characters per token
 CHARS_PER_TOKEN = 4
 
 
 class Storage:
-    """Manages ChromaDB for facts/recipes and CogDB for entities/relationships."""
+    """Manages GrafitoDB for all data: entities, relationships, facts, recipes."""
 
     def __init__(
         self,
-        chromadb_host: str = "localhost",
-        chromadb_port: int = 8000,
-        chromadb_persist_directory: str = "",
-        cogdb_home: str = "forma_graph",
-        cogdb_path_prefix: str = "./cog_data",
-        chromadb_max_file_handles: int = 256,
-        cogdb_index_capacity: int = 50000,
-        cogdb_l2_cache_size: int = 50000,
+        grafitodb_path: str = "./grafito_data/forma.db",
+        grafitodb_embedding_model: str = "all-MiniLM-L6-v2",
+        grafitodb_vector_dim: int = 384,
+        grafitodb_model_cache_path: str = "./models",
     ) -> None:
-        """Initialize ChromaDB and CogDB with configurable limits."""
-        # Initialize ChromaDB for facts and recipes
-        self.chroma_client = self._create_chroma_client(
-            chromadb_host, chromadb_port, chromadb_persist_directory, chromadb_max_file_handles
+        """Initialize GrafitoDB with configurable settings."""
+        # Ensure storage directory exists
+        db_dir = os.path.dirname(grafitodb_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
+
+        # Initialize GrafitoDB
+        self.db = GrafitoDatabase(db_path=grafitodb_path)
+        logger.info(f"GrafitoDB initialized at: {grafitodb_path}")
+
+        # Ensure model is cached locally, then load from cache
+        model_path = self._ensure_model_cached(
+            grafitodb_embedding_model, grafitodb_model_cache_path
         )
-        self.facts_collection = self._get_or_create_collection(FACTS_COLLECTION)
-        self.recipes_collection = self._get_or_create_collection(RECIPES_COLLECTION)
+
+        # Initialize embedding function for vector search
+        self.embedding_function = SentenceTransformerEmbeddingFunction(model_name=model_path)
+        self.db.register_embedding_function("default", self.embedding_function)
+
+        # Create vector indexes for facts and recipes
+        self._create_vector_indexes(grafitodb_vector_dim)
+
+    def _ensure_model_cached(self, model_name: str, cache_path: str) -> str:
+        """
+        Ensure the embedding model is cached locally.
+
+        Downloads the model to the cache directory if not present,
+        then returns the local path for loading.
+
+        Args:
+            model_name: Name of the SentenceTransformer model (e.g., 'all-MiniLM-L6-v2')
+            cache_path: Root directory for model cache
+
+        Returns:
+            Local path to the cached model
+        """
+        # Build the expected local model path
+        local_model_path = os.path.join(cache_path, model_name)
+
+        # Check if model already exists locally
+        if os.path.isdir(local_model_path):
+            # Check for required model files
+            required_files = ["config.json", "pytorch_model.bin"]
+            # Also check for model.safetensors as alternative to pytorch_model.bin
+            has_model_file = any(
+                os.path.isfile(os.path.join(local_model_path, f))
+                for f in ["pytorch_model.bin", "model.safetensors"]
+            )
+
+            if os.path.isfile(os.path.join(local_model_path, "config.json")) and has_model_file:
+                logger.info(f"Loading embedding model from local cache: {local_model_path}")
+                return local_model_path
+            else:
+                logger.info(f"Incomplete model cache found, re-downloading to: {local_model_path}")
+
+        # Model not cached locally, download and save
         logger.info(
-            f"ChromaDB initialized - facts: {FACTS_COLLECTION}, recipes: {RECIPES_COLLECTION}"
+            f"Downloading embedding model '{model_name}' to local cache: {local_model_path}"
         )
 
-        # Initialize CogDB for entities and relationships
-        self.graph = self._create_cogdb_graph(
-            cogdb_home, cogdb_path_prefix, cogdb_index_capacity, cogdb_l2_cache_size
-        )
-        logger.info(f"CogDB initialized - graph: {cogdb_home}")
+        # Ensure cache directory exists
+        os.makedirs(cache_path, exist_ok=True)
 
-    def _calculate_chroma_score(
-        self, confidence: float, distance: float, timestamp: str, decay_days: float = 30.0
+        try:
+            # Download the model using SentenceTransformer
+            model = SentenceTransformer(model_name)
+
+            # Save to local cache
+            model.save(local_model_path)
+            logger.info(f"Embedding model saved to local cache: {local_model_path}")
+
+            return local_model_path
+        except Exception as e:
+            logger.error(f"Failed to download/save model '{model_name}': {e}")
+            logger.warning(f"Falling back to online model loading (will download each restart)")
+            return model_name
+
+    def _create_vector_indexes(self, dim: int) -> None:
+        """Create vector indexes for facts and recipes semantic search."""
+        try:
+            self.db.create_vector_index(
+                name=FACTS_VECTOR_INDEX,
+                dim=dim,
+                embedding_function=self.embedding_function,
+                if_not_exists=True,
+            )
+            logger.info(f"Created vector index: {FACTS_VECTOR_INDEX} (dim={dim})")
+
+            self.db.create_vector_index(
+                name=RECIPES_VECTOR_INDEX,
+                dim=dim,
+                embedding_function=self.embedding_function,
+                if_not_exists=True,
+            )
+            logger.info(f"Created vector index: {RECIPES_VECTOR_INDEX} (dim={dim})")
+        except Exception as e:
+            logger.warning(f"Could not create vector indexes: {e}")
+
+    def _calculate_score(
+        self, confidence: float, distance: float | None, timestamp: str, decay_days: float = 30.0
     ) -> float:
         """
-        Calculate composite score for ChromaDB results (facts, recipes).
+        Calculate composite score for results.
 
         Score = confidence * similarity * time_factor
 
-        - similarity = 1 - distance (cosine distance, lower = more similar)
+        - similarity = 1 - distance (if distance provided, else 1.0)
         - time_factor = exponential decay based on age (newer = higher)
         """
         try:
-            similarity = 1.0 - distance
+            similarity = 1.0 - (distance if distance is not None else 0.0)
             # Calculate age in hours
             if timestamp:
                 ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
@@ -77,35 +153,15 @@ class Storage:
             time_factor = math.exp(-age_hours / (decay_days * 24))
             return confidence * similarity * time_factor
         except Exception:
-            return confidence * (1.0 - distance)
-
-    def _calculate_cog_score(
-        self, confidence: float, timestamp: str, decay_days: float = 30.0
-    ) -> float:
-        """
-        Calculate composite score for CogDB results (relationships).
-
-        Score = confidence * time_factor
-
-        - time_factor = exponential decay based on age (newer = higher)
-        """
-        try:
-            # Calculate age in hours
-            if timestamp:
-                ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-                now = datetime.now(UTC)
-                age_hours = (now - ts).total_seconds() / 3600
-            else:
-                age_hours = 0
-            # Exponential decay: half-life = decay_days
-            time_factor = math.exp(-age_hours / (decay_days * 24))
-            return confidence * time_factor
-        except Exception:
-            return confidence
+            return confidence * (1.0 - (distance if distance is not None else 0.0))
 
     def _estimate_tokens(self, text: str) -> int:
         """Estimate token count from text length."""
         return len(text) // CHARS_PER_TOKEN
+
+    def _embed_text(self, text: str) -> list[float]:
+        """Generate embedding vector for text using the registered embedding function."""
+        return self.embedding_function([text])[0]
 
     def _format_relationship_for_context(self, rel: dict[str, Any]) -> str:
         """Format a relationship for context string."""
@@ -122,74 +178,13 @@ class Storage:
             desc = desc[:200] + "..."
         return f"- {desc}"
 
-    def _create_chroma_client(
-        self, host: str, port: int, persist_directory: str, max_file_handles: int
-    ) -> Any:
-        """Create ChromaDB client with file descriptor limit."""
-        if persist_directory:
-            logger.info(f"Using persistent ChromaDB at: {persist_directory}")
-            settings = ChromaSettings(
-                is_persistent=True,
-                persist_directory=persist_directory,
-                chroma_server_nofile=max_file_handles,
-                anonymized_telemetry=False,
-            )
-            return chromadb.PersistentClient(path=persist_directory, settings=settings)
-        # Try server mode first, fall back to in-memory ephemeral
-        try:
-            logger.info(f"Connecting to ChromaDB server at {host}:{port}")
-            return chromadb.HttpClient(host=host, port=port)
-        except Exception:
-            logger.warning(
-                f"Could not connect to ChromaDB server at {host}:{port}, "
-                "falling back to in-memory ephemeral client"
-            )
-            settings = ChromaSettings(
-                is_persistent=False,
-                chroma_server_nofile=max_file_handles,
-                anonymized_telemetry=False,
-            )
-            return chromadb.EphemeralClient(settings=settings)
-
-    def _get_or_create_collection(self, name: str) -> Any:
-        """Get or create a ChromaDB collection with cosine similarity."""
-        return cast(
-            Any,
-            self.chroma_client.get_or_create_collection(
-                name=name,
-                metadata={"hnsw:space": "cosine"},
-            ),
-        )
-
-    def _create_cogdb_graph(
-        self, graph_name: str, path_prefix: str, index_capacity: int, l2_cache_size: int
-    ) -> Graph:
-        """Create CogDB graph with configurable limits."""
-        # Ensure storage directory exists
-        os.makedirs(path_prefix, exist_ok=True)
-
-        # Create CogConfig with file descriptor limits
-        # Lower index_capacity and l2_cache_size reduce the number of open index files
-        cog_cfg = CogConfig(
-            COG_PATH_PREFIX=path_prefix,
-            COG_HOME=graph_name,
-            INDEX_CAPACITY=index_capacity,
-            LEVEL_2_CACHE_SIZE=l2_cache_size,
-        )
-
-        logger.info(
-            f"CogDB config - index_capacity={index_capacity}, l2_cache_size={l2_cache_size}"
-        )
-
-        return Graph(graph_name, config=cog_cfg)
-
     def store_entities(self, entities: list[dict[str, Any]]) -> int:
         """
-        Store entities in CogDB as nodes with type property.
+        Store entities in GrafitoDB as nodes.
 
-        Each entity is stored as:
-        - entity_name -> type -> entity_type (triple)
-        - entity_name -> confidence -> confidence_value (property)
+        Each entity is stored as a node with:
+        - labels: ["Entity", entity_type]
+        - properties: {name, confidence, extracted_at}
 
         Returns number of entities stored.
         """
@@ -207,32 +202,58 @@ class Storage:
             if not name.strip():
                 continue
 
-            # Store entity with type
-            self.graph.put(name, "type", entity_type)
-            # Store confidence as property
-            self.graph.put(name, "confidence", str(confidence))
-            # Store timestamp
-            self.graph.put(name, "extracted_at", timestamp)
-
-            count += 1
+            try:
+                # Check if entity already exists
+                existing = self.db.match_nodes(
+                    labels=["Entity"],
+                    properties={"name": name},
+                    limit=1,
+                )
+                if existing:
+                    # Update existing entity
+                    node = existing[0]
+                    self.db.update_node_properties(
+                        node.id,
+                        {
+                            "confidence": max(
+                                float(node.properties.get("confidence", 0.9)), confidence
+                            ),
+                            "extracted_at": timestamp,
+                        },
+                    )
+                    # Update labels if type changed
+                    current_labels = list(node.labels)
+                    if entity_type not in current_labels:
+                        self.db.add_labels(node.id, [entity_type])
+                else:
+                    # Create new entity node
+                    self.db.create_node(
+                        labels=["Entity", entity_type],
+                        properties={
+                            "name": name,
+                            "confidence": confidence,
+                            "extracted_at": timestamp,
+                        },
+                    )
+                count += 1
+            except Exception as e:
+                logger.debug(f"Error storing entity '{name}': {e}")
 
         if count > 0:
-            logger.info(f"Stored {count} entities to CogDB")
+            logger.info(f"Stored {count} entities to GrafitoDB")
 
         return count
 
     def store_relationships(self, relationships: list[dict[str, Any]]) -> int:
         """
-        Store relationships in CogDB as triples.
+        Store relationships in GrafitoDB as edges between entity nodes.
 
         Each relationship is stored as:
-        - subject -> predicate -> object (triple)
-        - Plus confidence and timestamp as properties
+        - source_node (Entity with name=subject) -> target_node (Entity with name=object)
+        - relationship type = predicate
+        - properties: {confidence, extracted_at}
 
-        Deduplicates by checking if relationship already exists.
-        Updates timestamp and keeps higher confidence if duplicate.
-
-        Returns number of relationships stored/updated.
+        Returns number of relationships stored.
         """
         if not relationships:
             return 0
@@ -249,48 +270,94 @@ class Storage:
             if not subject.strip() or not predicate.strip() or not obj.strip():
                 continue
 
-            rel_key = f"{subject}_{predicate}_{obj}"
+            # Skip metadata predicates
+            if predicate in ["type", "confidence", "extracted_at"]:
+                continue
 
-            # Check if relationship already exists
-            existing_result = self.graph.v(subject).out(predicate).all()
-            existing_obj = None
-            if existing_result.get("result"):
-                existing_obj = existing_result["result"][0].get("id")
-
-            if existing_obj == obj:
-                # Relationship exists - update timestamp and keep higher confidence
-                conf_result = self.graph.v(rel_key).out("confidence").all()
-                existing_conf = (
-                    float(conf_result.get("result", [{}])[0].get("id", "0.9"))
-                    if conf_result.get("result")
-                    else 0.9
+            try:
+                # Find source and target nodes
+                source_nodes = self.db.match_nodes(
+                    labels=["Entity"],
+                    properties={"name": subject},
+                    limit=1,
                 )
-                # Keep higher confidence
-                final_conf = max(existing_conf, confidence)
-                self.graph.put(rel_key, "confidence", str(final_conf))
-                self.graph.put(rel_key, "extracted_at", timestamp)
-            else:
-                # New relationship - store it
-                self.graph.put(subject, predicate, obj)
-                self.graph.put(rel_key, "confidence", str(confidence))
-                self.graph.put(rel_key, "extracted_at", timestamp)
-                count += 1
+                target_nodes = self.db.match_nodes(
+                    labels=["Entity"],
+                    properties={"name": obj},
+                    limit=1,
+                )
+
+                # Create missing entity nodes if needed
+                if not source_nodes:
+                    source_node = self.db.create_node(
+                        labels=["Entity"],
+                        properties={
+                            "name": subject,
+                            "confidence": 0.5,
+                            "extracted_at": timestamp,
+                        },
+                    )
+                else:
+                    source_node = source_nodes[0]
+
+                if not target_nodes:
+                    target_node = self.db.create_node(
+                        labels=["Entity"],
+                        properties={
+                            "name": obj,
+                            "confidence": 0.5,
+                            "extracted_at": timestamp,
+                        },
+                    )
+                else:
+                    target_node = target_nodes[0]
+
+                # Check if relationship already exists
+                existing_rels = self.db.match_relationships(
+                    source_id=source_node.id,
+                    target_id=target_node.id,
+                    rel_type=predicate,
+                )
+
+                if existing_rels:
+                    # Update existing relationship
+                    existing_rel = existing_rels[0]
+                    self.db.update_relationship_properties(
+                        existing_rel.id,
+                        {
+                            "confidence": max(
+                                float(existing_rel.properties.get("confidence", 0.9)), confidence
+                            ),
+                            "extracted_at": timestamp,
+                        },
+                    )
+                else:
+                    # Create new relationship
+                    self.db.create_relationship(
+                        source_id=source_node.id,
+                        target_id=target_node.id,
+                        rel_type=predicate,
+                        properties={"confidence": confidence, "extracted_at": timestamp},
+                    )
+                    count += 1
+            except Exception as e:
+                logger.debug(f"Error storing relationship '{subject}→{predicate}→{obj}': {e}")
 
         if count > 0:
-            logger.info(f"Stored {count} new relationships to CogDB")
+            logger.info(f"Stored {count} relationships to GrafitoDB")
 
         return count
 
     def store_facts(self, facts: list[dict[str, Any]]) -> int:
         """
-        Store facts in ChromaDB.
+        Store facts in GrafitoDB as nodes with embeddings.
 
-        Each fact is stored with:
-        - document: the statement text
-        - metadata: confidence, timestamp, source_type
-        - id: auto-generated
+        Each fact is stored as a node with:
+        - labels: ["Fact"]
+        - properties: {statement, confidence, timestamp}
+        - embedding: for semantic search
 
-        Deduplicates by checking for similar existing facts (distance < 0.05).
+        Deduplicates by checking for similar existing facts.
         Returns number of facts stored.
         """
         if not facts:
@@ -298,11 +365,9 @@ class Storage:
 
         timestamp = datetime.utcnow().isoformat()
         documents = []
-        metadatas = []
-        ids = []
         duplicate_threshold = 0.05  # Very similar = duplicate
 
-        for i, fact in enumerate(facts):
+        for fact in facts:
             statement = fact.get("statement", "")
             confidence = fact.get("confidence", 0.9)
 
@@ -310,54 +375,68 @@ class Storage:
             if not statement.strip() or statement.strip().upper() == "N/A":
                 continue
 
-            # Check for near-duplicate existing facts
+            # Check for near-duplicate existing facts using semantic search
             try:
-                existing = self.facts_collection.query(
-                    query_texts=[statement],
-                    n_results=1,
+                existing = self.db.semantic_search(
+                    vector=statement,  # Will be embedded by registered function
+                    k=1,
+                    index=FACTS_VECTOR_INDEX,
+                    filter_labels=["Fact"],
                 )
-                distances = existing.get("distances")
-                if distances and distances[0]:
-                    min_distance = distances[0][0]
-                    if min_distance < duplicate_threshold:
-                        # Near-duplicate found - skip
+                if existing:
+                    score = existing[0].get("score", 0.0)
+                    # score is similarity (higher = more similar), convert to distance
+                    distance = 1.0 - score
+                    if distance < duplicate_threshold:
                         logger.debug(f"Skipping duplicate fact: {statement[:50]}...")
                         continue
             except Exception:
-                pass  # If query fails, proceed to add
+                pass  # If search fails, proceed to add
 
-            fact_id = f"fact_{timestamp}_{i}"
-
-            documents.append(statement)
-            metadatas.append(
+            documents.append(
                 {
+                    "statement": statement,
                     "confidence": confidence,
                     "timestamp": timestamp,
-                    "source_type": "fact",
                 }
             )
-            ids.append(fact_id)
+
+        # Add facts with embeddings
+        for doc in documents:
+            try:
+                node = self.db.create_node(
+                    labels=["Fact"],
+                    properties={
+                        "statement": doc["statement"],
+                        "confidence": doc["confidence"],
+                        "timestamp": doc["timestamp"],
+                    },
+                )
+                # Compute embedding and upsert for semantic search
+                embedding = self._embed_text(doc["statement"])
+                self.db.upsert_embedding(
+                    node_id=node.id,
+                    vector=embedding,
+                    index=FACTS_VECTOR_INDEX,
+                )
+            except Exception as e:
+                logger.debug(f"Error storing fact: {e}")
 
         if documents:
-            self.facts_collection.add(
-                documents=documents,
-                metadatas=cast(list[Mapping[str, Any]], metadatas),
-                ids=ids,
-            )
-            logger.info(f"Stored {len(documents)} facts to ChromaDB")
+            logger.info(f"Stored {len(documents)} facts to GrafitoDB")
 
         return len(documents)
 
     def store_recipes(self, recipes: list[dict[str, Any]]) -> int:
         """
-        Store recipes in ChromaDB.
+        Store recipes in GrafitoDB as nodes with embeddings.
 
-        Each recipe is stored with:
-        - document: the description text
-        - metadata: confidence, timestamp, source_type
-        - id: auto-generated
+        Each recipe is stored as a node with:
+        - labels: ["Recipe"]
+        - properties: {description, confidence, timestamp}
+        - embedding: for semantic search
 
-        Deduplicates by checking for similar existing recipes (distance < 0.05).
+        Deduplicates by checking for similar existing recipes.
         Returns number of recipes stored.
         """
         if not recipes:
@@ -365,11 +444,9 @@ class Storage:
 
         timestamp = datetime.utcnow().isoformat()
         documents = []
-        metadatas = []
-        ids = []
         duplicate_threshold = 0.05  # Very similar = duplicate
 
-        for i, recipe in enumerate(recipes):
+        for recipe in recipes:
             description = recipe.get("description", "")
             confidence = recipe.get("confidence", 0.9)
 
@@ -377,41 +454,55 @@ class Storage:
             if not description.strip() or description.strip().upper() == "N/A":
                 continue
 
-            # Check for near-duplicate existing recipes
+            # Check for near-duplicate existing recipes using semantic search
             try:
-                existing = self.recipes_collection.query(
-                    query_texts=[description],
-                    n_results=1,
+                existing = self.db.semantic_search(
+                    vector=description,  # Will be embedded by registered function
+                    k=1,
+                    index=RECIPES_VECTOR_INDEX,
+                    filter_labels=["Recipe"],
                 )
-                distances = existing.get("distances")
-                if distances and distances[0]:
-                    min_distance = distances[0][0]
-                    if min_distance < duplicate_threshold:
-                        # Near-duplicate found - skip
+                if existing:
+                    score = existing[0].get("score", 0.0)
+                    # score is similarity (higher = more similar), convert to distance
+                    distance = 1.0 - score
+                    if distance < duplicate_threshold:
                         logger.debug(f"Skipping duplicate recipe: {description[:50]}...")
                         continue
             except Exception:
-                pass  # If query fails, proceed to add
+                pass  # If search fails, proceed to add
 
-            recipe_id = f"recipe_{timestamp}_{i}"
-
-            documents.append(description)
-            metadatas.append(
+            documents.append(
                 {
+                    "description": description,
                     "confidence": confidence,
                     "timestamp": timestamp,
-                    "source_type": "recipe",
                 }
             )
-            ids.append(recipe_id)
+
+        # Add recipes with embeddings
+        for doc in documents:
+            try:
+                node = self.db.create_node(
+                    labels=["Recipe"],
+                    properties={
+                        "description": doc["description"],
+                        "confidence": doc["confidence"],
+                        "timestamp": doc["timestamp"],
+                    },
+                )
+                # Compute embedding and upsert for semantic search
+                embedding = self._embed_text(doc["description"])
+                self.db.upsert_embedding(
+                    node_id=node.id,
+                    vector=embedding,
+                    index=RECIPES_VECTOR_INDEX,
+                )
+            except Exception as e:
+                logger.debug(f"Error storing recipe: {e}")
 
         if documents:
-            self.recipes_collection.add(
-                documents=documents,
-                metadatas=cast(list[Mapping[str, Any]], metadatas),
-                ids=ids,
-            )
-            logger.info(f"Stored {len(documents)} recipes to ChromaDB")
+            logger.info(f"Stored {len(documents)} recipes to GrafitoDB")
 
         return len(documents)
 
@@ -437,87 +528,99 @@ class Storage:
         """
         Query facts by semantic similarity.
 
-        Returns list of results with document, metadata, and distance.
+        Returns list of results with node properties and score.
         """
-        results = self.facts_collection.query(
-            query_texts=[query],
-            n_results=n_results,
-        )
+        try:
+            results = self.db.semantic_search(
+                vector=query,  # Will be embedded by registered function
+                k=n_results,
+                index=FACTS_VECTOR_INDEX,
+                filter_labels=["Fact"],
+            )
 
-        formatted: list[dict[str, Any]] = []
-        documents = results.get("documents")
-        metadatas = results.get("metadatas")
-        distances = results.get("distances")
-        ids = results.get("ids")
-        if documents and documents[0]:
-            for i, doc in enumerate(documents[0]):
-                formatted.append(
-                    {
-                        "document": doc,
-                        "metadata": metadatas[0][i] if metadatas else {},
-                        "distance": distances[0][i] if distances else None,
-                        "id": ids[0][i] if ids else None,
-                    }
-                )
-
-        return formatted
+            formatted: list[dict[str, Any]] = []
+            for result in results:
+                node = result.get("node")
+                if node:
+                    props = node.properties if hasattr(node, "properties") else {}
+                    formatted.append(
+                        {
+                            "document": props.get("statement", ""),
+                            "metadata": {
+                                "confidence": props.get("confidence", 0.9),
+                                "timestamp": props.get("timestamp", ""),
+                            },
+                            "distance": 1.0
+                            - result.get("score", 0.0),  # Convert similarity to distance
+                            "id": node.id if hasattr(node, "id") else None,
+                        }
+                    )
+            return formatted
+        except Exception as e:
+            logger.debug(f"Query facts error: {e}")
+            return []
 
     def query_recipes(self, query: str, n_results: int = 10) -> list[dict[str, Any]]:
         """
         Query recipes by semantic similarity.
 
-        Returns list of results with document, metadata, and distance.
+        Returns list of results with node properties and score.
         """
-        results = self.recipes_collection.query(
-            query_texts=[query],
-            n_results=n_results,
-        )
+        try:
+            results = self.db.semantic_search(
+                vector=query,  # Will be embedded by registered function
+                k=n_results,
+                index=RECIPES_VECTOR_INDEX,
+                filter_labels=["Recipe"],
+            )
 
-        formatted: list[dict[str, Any]] = []
-        documents = results.get("documents")
-        metadatas = results.get("metadatas")
-        distances = results.get("distances")
-        ids = results.get("ids")
-        if documents and documents[0]:
-            for i, doc in enumerate(documents[0]):
-                formatted.append(
-                    {
-                        "document": doc,
-                        "metadata": metadatas[0][i] if metadatas else {},
-                        "distance": distances[0][i] if distances else None,
-                        "id": ids[0][i] if ids else None,
-                    }
-                )
-
-        return formatted
+            formatted: list[dict[str, Any]] = []
+            for result in results:
+                node = result.get("node")
+                if node:
+                    props = node.properties if hasattr(node, "properties") else {}
+                    formatted.append(
+                        {
+                            "document": props.get("description", ""),
+                            "metadata": {
+                                "confidence": props.get("confidence", 0.9),
+                                "timestamp": props.get("timestamp", ""),
+                            },
+                            "distance": 1.0
+                            - result.get("score", 0.0),  # Convert similarity to distance
+                            "id": node.id if hasattr(node, "id") else None,
+                        }
+                    )
+            return formatted
+        except Exception as e:
+            logger.debug(f"Query recipes error: {e}")
+            return []
 
     def query_entity(self, name: str) -> dict[str, Any] | None:
         """
-        Query an entity by name from CogDB.
+        Query an entity by name from GrafitoDB.
 
         Returns entity with type and properties, or None if not found.
         """
         try:
-            result = self.graph.v(name).out("type").all()
-            if result.get("result") and len(result["result"]) > 0:
-                entity_type = result["result"][0].get("id")
-                confidence_result = self.graph.v(name).out("confidence").all()
-                confidence = (
-                    float(confidence_result["result"][0].get("id", "0.9"))
-                    if confidence_result.get("result")
-                    else 0.9
-                )
-                timestamp_result = self.graph.v(name).out("extracted_at").all()
-                timestamp = (
-                    timestamp_result["result"][0].get("id")
-                    if timestamp_result.get("result")
-                    else None
-                )
+            nodes = self.db.match_nodes(
+                labels=["Entity"],
+                properties={"name": name},
+                limit=1,
+            )
+            if nodes:
+                node = nodes[0]
+                # Extract type from labels (first label after "Entity")
+                entity_type = "other"
+                for label in node.labels:
+                    if label != "Entity":
+                        entity_type = label
+                        break
                 return {
                     "name": name,
                     "type": entity_type,
-                    "confidence": confidence,
-                    "extracted_at": timestamp,
+                    "confidence": float(node.properties.get("confidence", 0.9)),
+                    "extracted_at": node.properties.get("extracted_at", ""),
                 }
         except Exception:
             pass
@@ -527,7 +630,7 @@ class Storage:
         self, subject: str = "", predicate: str = "", n_results: int = 20
     ) -> list[dict[str, Any]]:
         """
-        Query relationships from CogDB.
+        Query relationships from GrafitoDB.
 
         If subject is provided, returns both:
         - Outgoing relationships (entity as subject)
@@ -536,162 +639,138 @@ class Storage:
 
         Returns list of relationships.
         """
-        relationships = []
+        relationships: list[dict[str, Any]] = []
         try:
             if subject:
-                # Get outgoing edges from subject (entity -> predicate -> object)
-                result = self.graph.v(subject).out().all("e")
-                edges = result.get("result", [])
-                for edge in edges:
-                    edge_labels = edge.get("edges", [])
-                    for pred in edge_labels:
-                        if pred in ["type", "confidence", "extracted_at"]:
-                            continue
-                        # Get the object for this predicate
-                        obj_result = self.graph.v(subject).out(pred).all()
-                        if obj_result.get("result"):
-                            obj = obj_result["result"][0].get("id")
-                            relationships.append(
-                                {
-                                    "subject": subject,
-                                    "predicate": pred,
-                                    "object": obj,
-                                }
-                            )
+                # Find the subject entity node
+                subject_nodes = self.db.match_nodes(
+                    labels=["Entity"],
+                    properties={"name": subject},
+                    limit=1,
+                )
+                if not subject_nodes:
+                    return relationships
 
-                # Get incoming edges by scanning all entities
-                # Find relationships where entity appears as object
-                scan_result = self.graph.scan(n_results, "v")
-                vertices = scan_result.get("result", [])
-                for vertex in vertices:
-                    v_name = vertex.get("id")
-                    # Skip metadata vertices
-                    if (
-                        v_name.startswith("202")  # timestamps
-                        or v_name
-                        in ["0.9", "1.0", "person", "organization", "other", "concept", "object"]
-                        or "_" in v_name
-                        and "->" not in v_name
-                    ):
+                subject_node = subject_nodes[0]
+
+                # Get outgoing relationships
+                outgoing_rels = self.db.match_relationships(
+                    source_id=subject_node.id,
+                    rel_type=predicate if predicate else None,
+                )
+                for rel in outgoing_rels:
+                    rel_pred = rel.type
+                    if rel_pred in ["type", "confidence", "extracted_at"]:
                         continue
-                    # Check if this vertex has outgoing relationships to our subject
-                    try:
-                        out_result = self.graph.v(v_name).out().all("e")
-                        out_edges = out_result.get("result", [])
-                        for edge in out_edges:
-                            edge_labels = edge.get("edges", [])
-                            for pred in edge_labels:
-                                if pred in ["type", "confidence", "extracted_at"]:
-                                    continue
-                                # Check if this edge points to our subject
-                                obj_result = self.graph.v(v_name).out(pred).all()
-                                if obj_result.get("result"):
-                                    for obj_item in obj_result["result"]:
-                                        obj = obj_item.get("id")
-                                        if obj == subject:
-                                            relationships.append(
-                                                {
-                                                    "subject": v_name,
-                                                    "predicate": pred,
-                                                    "object": subject,
-                                                }
-                                            )
-                    except Exception:
-                        continue
+                    # Get target node name
+                    target_node = self.db.get_node(rel.target_id)
+                    if target_node:
+                        relationships.append(
+                            {
+                                "subject": subject,
+                                "predicate": rel_pred,
+                                "object": target_node.properties.get("name", ""),
+                                "confidence": float(rel.properties.get("confidence", 0.9)),
+                                "extracted_at": rel.properties.get("extracted_at", ""),
+                            }
+                        )
+
+                # Get incoming relationships - find nodes that point to this entity
+                # Use Cypher query for efficiency
+                cypher = (
+                    "MATCH (e:Entity {name: '" + subject + "'}) "
+                    "MATCH (source:Entity)-[r]->(e) "
+                    "WHERE r.type NOT IN ['type', 'confidence', 'extracted_at'] "
+                    "RETURN source.name AS source_name, r.type AS rel_type, "
+                    "r.confidence AS confidence, r.extracted_at AS extracted_at "
+                    "LIMIT " + str(n_results)
+                )
+                try:
+                    incoming_results = self.db.execute(cypher)
+                    for result in incoming_results:
+                        relationships.append(
+                            {
+                                "subject": result.get("source_name", ""),
+                                "predicate": result.get("rel_type", ""),
+                                "object": subject,
+                                "confidence": float(result.get("confidence", 0.9)),
+                                "extracted_at": result.get("extracted_at", ""),
+                            }
+                        )
+                except Exception as e:
+                    logger.debug(f"Cypher query error for incoming relationships: {e}")
             else:
-                # Scan all vertices and find relationships
-                scan_result = self.graph.scan(n_results, "v")
-                vertices = scan_result.get("result", [])
-                for vertex in vertices:
-                    v_name = vertex.get("id")
-                    # Skip metadata vertices
-                    if (
-                        v_name.startswith("202")
-                        or v_name
-                        in ["0.9", "1.0", "person", "organization", "other", "concept", "object"]
-                        or "_" in v_name
-                        and "->" not in v_name
-                    ):
-                        continue
-                    type_result = self.graph.v(v_name).out("type").all()
-                    if not type_result.get("result"):
-                        continue
-                    rels = self.query_relationships(subject=v_name, n_results=5)
-                    relationships.extend(rels)
+                # Get all relationships using Cypher
+                cypher = (
+                    "MATCH (source:Entity)-[r]->(target:Entity) "
+                    "WHERE r.type NOT IN ['type', 'confidence', 'extracted_at'] "
+                    "RETURN source.name AS subject, r.type AS predicate, "
+                    "target.name AS object, r.confidence AS confidence, "
+                    "r.extracted_at AS extracted_at "
+                    "LIMIT " + str(n_results)
+                )
+                try:
+                    all_results = self.db.execute(cypher)
+                    for result in all_results:
+                        relationships.append(
+                            {
+                                "subject": result.get("subject", ""),
+                                "predicate": result.get("predicate", ""),
+                                "object": result.get("object", ""),
+                                "confidence": float(result.get("confidence", 0.9)),
+                                "extracted_at": result.get("extracted_at", ""),
+                            }
+                        )
+                except Exception as e:
+                    logger.debug(f"Cypher query error for all relationships: {e}")
         except Exception as e:
             logger.debug(f"Query relationships error: {e}")
 
         return relationships
 
     def get_stats(self) -> dict[str, Any]:
-        """Get stats from both storage systems."""
-        # ChromaDB stats
-        chroma_stats = {
-            "facts": self.facts_collection.count(),
-            "recipes": self.recipes_collection.count(),
-        }
+        """Get stats from GrafitoDB."""
+        entity_count = self.db.get_node_count()
+        relationship_count = self.db.get_relationship_count()
 
-        # CogDB stats (count unique vertices)
-        try:
-            scan_result = self.graph.scan(5000, "v")
-            entity_count = len(scan_result.get("result", []))
-        except Exception:
-            entity_count = 0
+        # Count facts and recipes by label
+        facts_nodes = self.db.match_nodes(labels=["Fact"])
+        recipes_nodes = self.db.match_nodes(labels=["Recipe"])
 
         return {
-            "chromadb": chroma_stats,
-            "cogdb": {"entities": entity_count},
+            "grafitodb": {
+                "entities": entity_count,
+                "relationships": relationship_count,
+                "facts": len(facts_nodes),
+                "recipes": len(recipes_nodes),
+            },
         }
 
     def close(self) -> None:
-        """Close all storage connections and release file handles."""
-        # Close ChromaDB client
+        """Close GrafitoDB connection."""
         try:
-            if hasattr(self.chroma_client, "close"):
-                self.chroma_client.close()
-                logger.info("ChromaDB client closed")
+            self.db.close()
+            logger.info("GrafitoDB closed")
         except Exception as e:
-            logger.error(f"Failed to close ChromaDB: {e}")
-
-        # Close CogDB graph
-        try:
-            if hasattr(self.graph, "close"):
-                self.graph.close()
-                logger.info("CogDB graph closed")
-        except Exception as e:
-            logger.error(f"Failed to close CogDB: {e}")
+            logger.error(f"Failed to close GrafitoDB: {e}")
 
     def clear_all(self) -> dict[str, Any]:
         """
-        Clear all data from ChromaDB and CogDB.
+        Clear all data from GrafitoDB.
 
         Returns stats showing what was cleared.
         """
         stats_before = self.get_stats()
 
-        # Clear ChromaDB collections
+        # Delete all nodes and relationships
         try:
-            # Delete all documents from facts collection
-            facts_ids = self.facts_collection.get()["ids"]
-            if facts_ids:
-                self.facts_collection.delete(ids=facts_ids)
-
-            # Delete all documents from recipes collection
-            recipes_ids = self.recipes_collection.get()["ids"]
-            if recipes_ids:
-                self.recipes_collection.delete(ids=recipes_ids)
-
-            logger.info("ChromaDB collections cleared")
+            # Get all nodes and delete them
+            all_nodes = self.db.match_nodes(limit=10000)
+            for node in all_nodes:
+                self.db.delete_node(node.id)
+            logger.info("GrafitoDB cleared")
         except Exception as e:
-            logger.error(f"Failed to clear ChromaDB: {e}")
-
-        # Clear CogDB graph
-        try:
-            # Use truncate to clear the entire graph
-            self.graph.truncate()
-            logger.info("CogDB graph cleared")
-        except Exception as e:
-            logger.error(f"Failed to clear CogDB: {e}")
+            logger.error(f"Failed to clear GrafitoDB: {e}")
 
         stats_after = self.get_stats()
 
@@ -699,9 +778,13 @@ class Storage:
             "before": stats_before,
             "after": stats_after,
             "cleared": {
-                "facts": stats_before["chromadb"]["facts"] - stats_after["chromadb"]["facts"],
-                "recipes": stats_before["chromadb"]["recipes"] - stats_after["chromadb"]["recipes"],
-                "entities": stats_before["cogdb"]["entities"] - stats_after["cogdb"]["entities"],
+                "facts": stats_before["grafitodb"]["facts"] - stats_after["grafitodb"]["facts"],
+                "recipes": stats_before["grafitodb"]["recipes"]
+                - stats_after["grafitodb"]["recipes"],
+                "entities": stats_before["grafitodb"]["entities"]
+                - stats_after["grafitodb"]["entities"],
+                "relationships": stats_before["grafitodb"]["relationships"]
+                - stats_after["grafitodb"]["relationships"],
             },
         }
 
@@ -717,11 +800,10 @@ class Storage:
         decay_days: float = 30.0,
     ) -> dict[str, Any]:
         """
-        Retrieve context from storage based on queries with composite scoring and token budget.
+        Retrieve context from GrafitoDB based on queries with composite scoring and token budget.
 
         Composite scoring:
-        - ChromaDB (facts, recipes): confidence * similarity * time_factor
-        - CogDB (relationships): confidence * time_factor
+        - confidence * similarity * time_factor
 
         Token budget: stops adding items when estimated token count reaches budget.
 
@@ -729,39 +811,21 @@ class Storage:
         """
         all_items: list[dict[str, Any]] = []  # Pool of all scored items
 
-        # Query CogDB for entity relationships
+        # Query GrafitoDB for entity relationships
         for entity in entities_queries:
             try:
                 entity_rels = self.query_relationships(subject=entity, n_results=query_limit)
                 for rel in entity_rels:
-                    rel_key = f"{rel['subject']}_{rel['predicate']}_{rel['object']}"
-                    ts_result = self.graph.v(rel_key).out("extracted_at").all()
-                    timestamp = (
-                        ts_result.get("result", [{}])[0].get("id", "")
-                        if ts_result.get("result")
-                        else ""
-                    )
-                    conf_result = self.graph.v(rel_key).out("confidence").all()
-                    confidence = (
-                        float(conf_result.get("result", [{}])[0].get("id", "0.9"))
-                        if conf_result.get("result")
-                        else 0.9
-                    )
+                    confidence = rel.get("confidence", 0.9)
+                    timestamp = rel.get("extracted_at", "")
 
                     if confidence >= min_confidence:
-                        score = self._calculate_cog_score(confidence, timestamp, decay_days)
+                        score = self._calculate_score(confidence, None, timestamp, decay_days)
                         formatted = self._format_relationship_for_context(rel)
                         all_items.append(
                             {
                                 "type": "relationship",
-                                "data": {
-                                    "subject": rel["subject"],
-                                    "predicate": rel["predicate"],
-                                    "object": rel["object"],
-                                    "confidence": confidence,
-                                    "timestamp": timestamp,
-                                    "source": entity,
-                                },
+                                "data": rel,
                                 "score": score,
                                 "formatted": formatted,
                                 "tokens": self._estimate_tokens(formatted),
@@ -770,7 +834,7 @@ class Storage:
             except Exception as e:
                 logger.debug(f"Query entity relationships error for {entity}: {e}")
 
-        # Query ChromaDB for facts
+        # Query facts by semantic search
         if fact_query:
             try:
                 fact_results = self.query_facts(fact_query, n_results=query_limit)
@@ -780,9 +844,7 @@ class Storage:
                     timestamp = fact.get("metadata", {}).get("timestamp", "")
 
                     if confidence >= min_confidence and distance <= max_distance:
-                        score = self._calculate_chroma_score(
-                            confidence, distance, timestamp, decay_days
-                        )
+                        score = self._calculate_score(confidence, distance, timestamp, decay_days)
                         formatted = self._format_fact_for_context({"statement": fact["document"]})
                         all_items.append(
                             {
@@ -801,7 +863,7 @@ class Storage:
             except Exception as e:
                 logger.debug(f"Query facts error: {e}")
 
-        # Query ChromaDB for recipes
+        # Query recipes by semantic search
         if recipe_query:
             try:
                 recipe_results = self.query_recipes(recipe_query, n_results=query_limit)
@@ -811,9 +873,7 @@ class Storage:
                     timestamp = recipe.get("metadata", {}).get("timestamp", "")
 
                     if confidence >= min_confidence and distance <= max_distance:
-                        score = self._calculate_chroma_score(
-                            confidence, distance, timestamp, decay_days
-                        )
+                        score = self._calculate_score(confidence, distance, timestamp, decay_days)
                         formatted = self._format_recipe_for_context(
                             {"description": recipe["document"]}
                         )
@@ -866,9 +926,9 @@ class Storage:
         deduped_items.sort(key=lambda x: x["score"], reverse=True)
 
         # Build context within token budget
-        relationships = []
-        facts = []
-        recipes = []
+        relationships: list[dict[str, Any]] = []
+        facts: list[dict[str, Any]] = []
+        recipes: list[dict[str, Any]] = []
         scores: dict[str, list[float]] = {"relationships": [], "facts": [], "recipes": []}
         tokens_used = 0
 
@@ -916,7 +976,7 @@ class Storage:
 
         Returns a formatted string suitable for prepending to user message.
         """
-        lines = []
+        lines: list[str] = []
 
         if context.get("relationships"):
             lines.append("Known relationships:")

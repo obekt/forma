@@ -25,19 +25,6 @@ class OpenAIProxy:
         if settings.upstream_api_key:
             self.headers["Authorization"] = f"Bearer {settings.upstream_api_key}"
 
-        # Separate embedding endpoint configuration
-        self.embedding_url = (
-            settings.embedding_base_url.rstrip("/")
-            if settings.embedding_base_url
-            else self.base_url
-        )
-        self.embedding_headers = {"Content-Type": "application/json"}
-        if settings.embedding_api_key:
-            self.embedding_headers["Authorization"] = f"Bearer {settings.embedding_api_key}"
-        elif settings.upstream_api_key and not settings.embedding_base_url:
-            # Fall back to upstream API key if embedding endpoint not separately configured
-            self.embedding_headers["Authorization"] = f"Bearer {settings.upstream_api_key}"
-
         # Extraction LLM endpoint configuration
         self.extractor_url = (
             settings.extractor_base_url.rstrip("/")
@@ -187,47 +174,6 @@ class OpenAIProxy:
             return await self.stream_request("POST", "/completions", payload)
         return await self._forward_request("POST", "/completions", payload)
 
-    async def embeddings(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Forward embedding request to embedding endpoint."""
-        url = f"{self.embedding_url}/embeddings"
-
-        # Apply model mapping or use default embedding model
-        if "model" in payload:
-            payload["model"] = self._map_model(payload["model"])
-        elif self.settings.embedding_model_name:
-            payload["model"] = self.settings.embedding_model_name
-
-        try:
-            response = await self._client.request(
-                method="POST",
-                url=url,
-                headers=self.embedding_headers,
-                json=payload,
-                timeout=self.settings.embedding_timeout,
-            )
-            response.raise_for_status()
-            return cast(dict[str, Any], response.json())
-        except httpx.TimeoutException as e:
-            logger.error(f"Embedding endpoint timeout: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-                detail="Embedding endpoint timeout",
-            ) from e
-        except httpx.HTTPStatusError as e:
-            logger.error(
-                f"Embedding endpoint error: {e.response.status_code} - {e.response.text}"
-            )
-            raise HTTPException(
-                status_code=e.response.status_code,
-                detail=e.response.text,
-            ) from e
-        except httpx.RequestError as e:
-            logger.error(f"Embedding endpoint connection error: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"Embedding endpoint connection error: {e}",
-            ) from e
-
     async def extract(
         self,
         messages: list[dict[str, str]],
@@ -286,9 +232,7 @@ class OpenAIProxy:
                 detail="Extraction endpoint timeout",
             ) from e
         except httpx.HTTPStatusError as e:
-            logger.error(
-                f"Extraction endpoint error: {e.response.status_code} - {e.response.text}"
-            )
+            logger.error(f"Extraction endpoint error: {e.response.status_code} - {e.response.text}")
             raise HTTPException(
                 status_code=e.response.status_code,
                 detail=e.response.text,

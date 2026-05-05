@@ -24,13 +24,6 @@ class Settings(BaseSettings):
     upstream_api_key: str = ""
     upstream_timeout: float = 300.0  # 5 minutes for long requests
 
-    # Embedding API configuration (separate endpoint)
-    # If set, embeddings requests go here instead of upstream_base_url
-    embedding_base_url: str = ""  # Empty = use upstream_base_url for embeddings
-    embedding_api_key: str = ""  # Empty = no auth for embedding endpoint
-    embedding_model_name: str = ""  # Default model for embeddings if not specified
-    embedding_timeout: float = 60.0  # 1 minute for embedding requests
-
     # Extraction LLM configuration (for entity/relationship/fact extraction)
     # Used internally by Forma's RAG pipeline, not exposed as endpoint
     extractor_base_url: str = ""  # Empty = use upstream_base_url for extraction
@@ -38,23 +31,12 @@ class Settings(BaseSettings):
     extractor_model_name: str = ""  # Model for extraction tasks
     extractor_timeout: float = 120.0  # 2 minutes for extraction (may need more time)
 
-    # ChromaDB configuration (for storing extracted facts and recipes)
-    # Note: port is only used when persist_directory is empty (HttpClient mode)
-    # Default port 8001 to avoid conflict with Forma server port 8000
-    chromadb_host: str = "localhost"
-    chromadb_port: int = 8001
-    chromadb_persist_directory: str = (
-        ""  # Empty = use in-memory (ephemeral), or path for persistent
-    )
-
-    # CogDB configuration (for storing entities and relationships as graph)
-    cogdb_home: str = "forma_graph"  # Graph database name
-    cogdb_path_prefix: str = "./cog_data"  # Storage directory for CogDB
-
-    # File descriptor limits to prevent exhaustion under load
-    chromadb_max_file_handles: int = 256  # Max open files for ChromaDB
-    cogdb_index_capacity: int = 50000  # Index hash table size (lower = fewer indices)
-    cogdb_l2_cache_size: int = 50000  # L2 cache entries (lower = fewer cached handles)
+    # GrafitoDB configuration (SQLite-backed graph + vector database)
+    # Single file database - minimal file descriptors
+    grafitodb_path: str = "./grafito_data/forma.db"  # SQLite database file path
+    grafitodb_embedding_model: str = "all-MiniLM-L6-v2"  # SentenceTransformer model for embeddings
+    grafitodb_vector_dim: int = 384  # Embedding dimension (depends on model)
+    grafitodb_model_cache_path: str = "./models"  # Local cache for embedding model
 
     # Model mapping (optional: map local model names to upstream models)
     # Format: "local_name:upstream_name,local_name2:upstream_name2"
