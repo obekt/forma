@@ -280,9 +280,9 @@ uv run ruff check src/forma
 
 ```
 Request → Extract → Retrieve → Augment → Forward → Response
-                         │
-                         ▼
-                  Background Store
+                                                   ↓
+                                            Background Store
+                                            (async, fire-and-forget)
 ```
 
 ### Storage Backend
