@@ -1,5 +1,6 @@
 """Extraction system for entities, relationships, and facts."""
 
+import contextlib
 import json
 import logging
 import re
@@ -295,6 +296,9 @@ class Extractor:
         self.settings = settings
         self.proxy = proxy
         self._ensure_logs_dir()
+        self._log_file = open(  # noqa: SIM115
+            LOGS_DIR / "extractions.jsonl", "a", encoding="utf-8"
+        )
 
     def _load_prompt_template(self) -> str:
         """Load the extraction prompt template from file (called each time for live updates)."""
@@ -353,6 +357,11 @@ class Extractor:
 
         return result
 
+    def close(self) -> None:
+        """Close the persistent log file handle."""
+        with contextlib.suppress(Exception):
+            self._log_file.close()
+
     def _log_extraction(self, text: str, result: ExtractionResult) -> None:
         """Log extraction result to file."""
         log_entry = {
@@ -362,10 +371,9 @@ class Extractor:
             "extraction": result.to_dict(),
         }
 
-        log_file = LOGS_DIR / "extractions.jsonl"
         try:
-            with open(log_file, "a", encoding="utf-8") as f:
-                f.write(json.dumps(log_entry) + "\n")
+            self._log_file.write(json.dumps(log_entry) + "\n")
+            self._log_file.flush()
             logger.debug(
                 f"Logged extraction: {len(result.entities)} entities, "
                 f"{len(result.relationships)} relationships, "

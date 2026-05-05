@@ -51,8 +51,10 @@ class OpenAIProxy:
             # Fall back to upstream API key if extraction endpoint not separately configured
             self.extractor_headers["Authorization"] = f"Bearer {settings.upstream_api_key}"
 
-        # Reusable HTTP client (connection pooled)
-        self._client = httpx.AsyncClient()
+        # Reusable HTTP client (connection pooled, limited)
+        self._client = httpx.AsyncClient(
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=50),
+        )
 
     async def close(self) -> None:
         """Close the underlying HTTP client."""

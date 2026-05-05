@@ -1,6 +1,7 @@
 """FastAPI application entry point."""
 
 import asyncio
+import contextlib
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -31,6 +32,21 @@ LOGS_DIR = Path(__file__).parent.parent.parent / "logs"
 proxy: OpenAIProxy
 extractor: Extractor
 storage: Storage
+_storage_lock = asyncio.Lock()
+
+
+_retrieval_log_file: Any = None
+
+
+def _ensure_retrieval_log() -> Any:
+    """Open persistent retrieval log file handle."""
+    global _retrieval_log_file
+    if _retrieval_log_file is None:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        _retrieval_log_file = open(  # noqa: SIM115
+            LOGS_DIR / "retrievals.jsonl", "a", encoding="utf-8"
+        )
+    return _retrieval_log_file
 
 
 def _log_context_retrieval(
@@ -41,7 +57,6 @@ def _log_context_retrieval(
     augmented_prompt: str | None,
 ) -> None:
     """Log context retrieval to file for debugging."""
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
     log_entry = {
         "timestamp": datetime.utcnow().isoformat(),
         "queries": {
@@ -58,10 +73,10 @@ def _log_context_retrieval(
         "scores": context.get("scores", {}),
         "augmented_prompt": augmented_prompt,
     }
-    log_file = LOGS_DIR / "retrievals.jsonl"
     try:
-        with open(log_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(log_entry) + "\n")
+        f = _ensure_retrieval_log()
+        f.write(json.dumps(log_entry) + "\n")
+        f.flush()
         logger.debug(
             f"Logged retrieval: {len(context.get('relationships', []))} relationships, "
             f"{len(context.get('facts', []))} facts, {len(context.get('recipes', []))} recipes, "
@@ -78,18 +93,19 @@ async def _store_extraction_background(
     recipes: list[dict[str, Any]],
 ) -> None:
     """Background task to store extracted data."""
-    try:
-        if entities or relationships or facts or recipes:
-            entities_count, relationships_count, facts_count, recipes_count = (
-                storage.store_extraction(entities, relationships, facts, recipes)
-            )
-            logger.info(
-                f"Stored (background): {entities_count} entities, "
-                f"{relationships_count} relationships, "
-                f"{facts_count} facts, {recipes_count} recipes"
-            )
-    except Exception as e:
-        logger.error(f"Background storage error: {e}")
+    async with _storage_lock:
+        try:
+            if entities or relationships or facts or recipes:
+                entities_count, relationships_count, facts_count, recipes_count = (
+                    storage.store_extraction(entities, relationships, facts, recipes)
+                )
+                logger.info(
+                    f"Stored (background): {entities_count} entities, "
+                    f"{relationships_count} relationships, "
+                    f"{facts_count} facts, {recipes_count} recipes"
+                )
+        except Exception as e:
+            logger.error(f"Background storage error: {e}")
 
 
 @asynccontextmanager
@@ -131,6 +147,10 @@ async def lifespan(app: FastAPI) -> Any:
     yield
     logger.info("Forma proxy shutting down")
     await proxy.close()
+    extractor.close()
+    if _retrieval_log_file is not None:
+        with contextlib.suppress(Exception):
+            _retrieval_log_file.close()
 
 
 app = FastAPI(
