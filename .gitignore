@@ -75,10 +75,11 @@ grafito_data/
 models/*
 !models/.gitkeep
 
-# Benchmark outputs
+# Benchmark outputs and scripts (contains API keys)
 benchmarks/**/results/
 benchmarks/**/__pycache__/
 benchmarks/**/*.log
+benchmarks/**/*.py
 # Large dataset files (>50MB)
 benchmarks/**/data/*_s_*.json
 
