@@ -51,6 +51,13 @@ class OpenAIProxy:
             # Fall back to upstream API key if extraction endpoint not separately configured
             self.extractor_headers["Authorization"] = f"Bearer {settings.upstream_api_key}"
 
+        # Reusable HTTP client (connection pooled)
+        self._client = httpx.AsyncClient()
+
+    async def close(self) -> None:
+        """Close the underlying HTTP client."""
+        await self._client.aclose()
+
     def _map_model(self, model: str) -> str:
         """Map local model name to upstream model name."""
         mapping = self.settings.get_model_mapping()
@@ -67,34 +74,34 @@ class OpenAIProxy:
         if payload and "model" in payload:
             payload["model"] = self._map_model(payload["model"])
 
-        async with httpx.AsyncClient(timeout=self.settings.upstream_timeout) as client:
-            try:
-                response = await client.request(
-                    method=method,
-                    url=url,
-                    headers=self.headers,
-                    json=payload,
-                )
-                response.raise_for_status()
-                return cast(dict[str, Any], response.json())
-            except httpx.TimeoutException as e:
-                logger.error(f"Upstream timeout: {e}")
-                raise HTTPException(
-                    status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-                    detail="Upstream API timeout",
-                ) from e
-            except httpx.HTTPStatusError as e:
-                logger.error(f"Upstream error: {e.response.status_code} - {e.response.text}")
-                raise HTTPException(
-                    status_code=e.response.status_code,
-                    detail=e.response.text,
-                ) from e
-            except httpx.RequestError as e:
-                logger.error(f"Upstream connection error: {e}")
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail=f"Upstream connection error: {e}",
-                ) from e
+        try:
+            response = await self._client.request(
+                method=method,
+                url=url,
+                headers=self.headers,
+                json=payload,
+                timeout=self.settings.upstream_timeout,
+            )
+            response.raise_for_status()
+            return cast(dict[str, Any], response.json())
+        except httpx.TimeoutException as e:
+            logger.error(f"Upstream timeout: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                detail="Upstream API timeout",
+            ) from e
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Upstream error: {e.response.status_code} - {e.response.text}")
+            raise HTTPException(
+                status_code=e.response.status_code,
+                detail=e.response.text,
+            ) from e
+        except httpx.RequestError as e:
+            logger.error(f"Upstream connection error: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Upstream connection error: {e}",
+            ) from e
 
     async def stream_request(
         self,
@@ -108,50 +115,50 @@ class OpenAIProxy:
             payload["model"] = self._map_model(payload["model"])
 
         async def stream_generator() -> Any:
-            async with httpx.AsyncClient(timeout=self.settings.upstream_timeout) as client:
-                try:
-                    async with client.stream(
-                        method=method,
-                        url=url,
-                        headers=self.headers,
-                        json=payload,
-                    ) as response:
-                        response.raise_for_status()
-                        async for chunk in response.aiter_bytes():
-                            yield chunk
-                except httpx.TimeoutException as e:
-                    logger.error(f"Upstream stream timeout: {e}")
-                    error_data = json.dumps(
-                        {
-                            "error": {
-                                "message": "Upstream API timeout",
-                                "type": "timeout_error",
-                            }
+            try:
+                async with self._client.stream(
+                    method=method,
+                    url=url,
+                    headers=self.headers,
+                    json=payload,
+                    timeout=self.settings.upstream_timeout,
+                ) as response:
+                    response.raise_for_status()
+                    async for chunk in response.aiter_bytes():
+                        yield chunk
+            except httpx.TimeoutException as e:
+                logger.error(f"Upstream stream timeout: {e}")
+                error_data = json.dumps(
+                    {
+                        "error": {
+                            "message": "Upstream API timeout",
+                            "type": "timeout_error",
                         }
-                    )
-                    yield f"data: {error_data}\n\n".encode()
-                except httpx.HTTPStatusError as e:
-                    logger.error(f"Upstream stream error: {e.response.status_code}")
-                    error_data = json.dumps(
-                        {
-                            "error": {
-                                "message": e.response.text,
-                                "type": "upstream_error",
-                            }
+                    }
+                )
+                yield f"data: {error_data}\n\n".encode()
+            except httpx.HTTPStatusError as e:
+                logger.error(f"Upstream stream error: {e.response.status_code}")
+                error_data = json.dumps(
+                    {
+                        "error": {
+                            "message": e.response.text,
+                            "type": "upstream_error",
                         }
-                    )
-                    yield f"data: {error_data}\n\n".encode()
-                except httpx.RequestError as e:
-                    logger.error(f"Upstream stream connection error: {e}")
-                    error_data = json.dumps(
-                        {
-                            "error": {
-                                "message": f"Upstream connection error: {e}",
-                                "type": "connection_error",
-                            }
+                    }
+                )
+                yield f"data: {error_data}\n\n".encode()
+            except httpx.RequestError as e:
+                logger.error(f"Upstream stream connection error: {e}")
+                error_data = json.dumps(
+                    {
+                        "error": {
+                            "message": f"Upstream connection error: {e}",
+                            "type": "connection_error",
                         }
-                    )
-                    yield f"data: {error_data}\n\n".encode()
+                    }
+                )
+                yield f"data: {error_data}\n\n".encode()
 
         return StreamingResponse(
             stream_generator(),
@@ -188,38 +195,36 @@ class OpenAIProxy:
         elif self.settings.embedding_model_name:
             payload["model"] = self.settings.embedding_model_name
 
-        timeout = self.settings.embedding_timeout
-
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            try:
-                response = await client.request(
-                    method="POST",
-                    url=url,
-                    headers=self.embedding_headers,
-                    json=payload,
-                )
-                response.raise_for_status()
-                return cast(dict[str, Any], response.json())
-            except httpx.TimeoutException as e:
-                logger.error(f"Embedding endpoint timeout: {e}")
-                raise HTTPException(
-                    status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-                    detail="Embedding endpoint timeout",
-                ) from e
-            except httpx.HTTPStatusError as e:
-                logger.error(
-                    f"Embedding endpoint error: {e.response.status_code} - {e.response.text}"
-                )
-                raise HTTPException(
-                    status_code=e.response.status_code,
-                    detail=e.response.text,
-                ) from e
-            except httpx.RequestError as e:
-                logger.error(f"Embedding endpoint connection error: {e}")
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail=f"Embedding endpoint connection error: {e}",
-                ) from e
+        try:
+            response = await self._client.request(
+                method="POST",
+                url=url,
+                headers=self.embedding_headers,
+                json=payload,
+                timeout=self.settings.embedding_timeout,
+            )
+            response.raise_for_status()
+            return cast(dict[str, Any], response.json())
+        except httpx.TimeoutException as e:
+            logger.error(f"Embedding endpoint timeout: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                detail="Embedding endpoint timeout",
+            ) from e
+        except httpx.HTTPStatusError as e:
+            logger.error(
+                f"Embedding endpoint error: {e.response.status_code} - {e.response.text}"
+            )
+            raise HTTPException(
+                status_code=e.response.status_code,
+                detail=e.response.text,
+            ) from e
+        except httpx.RequestError as e:
+            logger.error(f"Embedding endpoint connection error: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Embedding endpoint connection error: {e}",
+            ) from e
 
     async def extract(
         self,
@@ -261,34 +266,34 @@ class OpenAIProxy:
             payload["reasoning_effort"] = "none"
             payload["enable_thinking"] = False
 
-        async with httpx.AsyncClient(timeout=self.settings.extractor_timeout) as client:
-            try:
-                response = await client.request(
-                    method="POST",
-                    url=url,
-                    headers=self.extractor_headers,
-                    json=payload,
-                )
-                response.raise_for_status()
-                data = cast(dict[str, Any], response.json())
-                return cast(str, data["choices"][0]["message"]["content"])
-            except httpx.TimeoutException as e:
-                logger.error(f"Extraction endpoint timeout: {e}")
-                raise HTTPException(
-                    status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-                    detail="Extraction endpoint timeout",
-                ) from e
-            except httpx.HTTPStatusError as e:
-                logger.error(
-                    f"Extraction endpoint error: {e.response.status_code} - {e.response.text}"
-                )
-                raise HTTPException(
-                    status_code=e.response.status_code,
-                    detail=e.response.text,
-                ) from e
-            except httpx.RequestError as e:
-                logger.error(f"Extraction endpoint connection error: {e}")
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail=f"Extraction endpoint connection error: {e}",
-                ) from e
+        try:
+            response = await self._client.request(
+                method="POST",
+                url=url,
+                headers=self.extractor_headers,
+                json=payload,
+                timeout=self.settings.extractor_timeout,
+            )
+            response.raise_for_status()
+            data = cast(dict[str, Any], response.json())
+            return cast(str, data["choices"][0]["message"]["content"])
+        except httpx.TimeoutException as e:
+            logger.error(f"Extraction endpoint timeout: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                detail="Extraction endpoint timeout",
+            ) from e
+        except httpx.HTTPStatusError as e:
+            logger.error(
+                f"Extraction endpoint error: {e.response.status_code} - {e.response.text}"
+            )
+            raise HTTPException(
+                status_code=e.response.status_code,
+                detail=e.response.text,
+            ) from e
+        except httpx.RequestError as e:
+            logger.error(f"Extraction endpoint connection error: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Extraction endpoint connection error: {e}",
+            ) from e

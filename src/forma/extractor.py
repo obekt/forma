@@ -291,8 +291,9 @@ class ExtractionResult:
 class Extractor:
     """Handles extraction of entities, relationships, and facts from text."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, proxy: Any = None) -> None:
         self.settings = settings
+        self.proxy = proxy
         self._ensure_logs_dir()
 
     def _load_prompt_template(self) -> str:
@@ -335,8 +336,8 @@ class Extractor:
         # Build prompt
         messages = self.build_extraction_prompt(text)
 
-        # Call extraction LLM
-        proxy = OpenAIProxy(self.settings)
+        # Call extraction LLM (reuse global proxy if available)
+        proxy = self.proxy or OpenAIProxy(self.settings)
         response = await proxy.extract(
             messages=messages,
             max_tokens=512,  # Lower since no reasoning output

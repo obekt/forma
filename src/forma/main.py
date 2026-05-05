@@ -98,7 +98,7 @@ async def lifespan(app: FastAPI) -> Any:
     global proxy, extractor, storage
     settings = get_settings()
     proxy = OpenAIProxy(settings)
-    extractor = Extractor(settings)
+    extractor = Extractor(settings, proxy=proxy)
     storage = Storage(
         chromadb_host=settings.chromadb_host,
         chromadb_port=settings.chromadb_port,
@@ -130,6 +130,7 @@ async def lifespan(app: FastAPI) -> Any:
     )
     yield
     logger.info("Forma proxy shutting down")
+    await proxy.close()
 
 
 app = FastAPI(
