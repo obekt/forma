@@ -84,7 +84,8 @@ async def _store_extraction_background(
                 storage.store_extraction(entities, relationships, facts, recipes)
             )
             logger.info(
-                f"Stored (background): {entities_count} entities, {relationships_count} relationships, "
+                f"Stored (background): {entities_count} entities, "
+                f"{relationships_count} relationships, "
                 f"{facts_count} facts, {recipes_count} recipes"
             )
     except Exception as e:
@@ -92,7 +93,7 @@ async def _store_extraction_background(
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> Any:
     """Manage application lifespan."""
     global proxy, extractor, storage
     settings = get_settings()
@@ -108,20 +109,23 @@ async def lifespan(app: FastAPI):
     logger.info(f"Forma proxy starting - upstream: {settings.upstream_base_url}")
     if settings.embedding_base_url:
         logger.info(
-            f"Embedding endpoint: {settings.embedding_base_url} (model: {settings.embedding_model_name})"
+            f"Embedding endpoint: {settings.embedding_base_url} "
+            f"(model: {settings.embedding_model_name})"
         )
     else:
         logger.info("Embeddings will use upstream endpoint")
     if settings.extractor_base_url:
         logger.info(
-            f"Extraction endpoint: {settings.extractor_base_url} (model: {settings.extractor_model_name})"
+            f"Extraction endpoint: {settings.extractor_base_url} "
+            f"(model: {settings.extractor_model_name})"
         )
     else:
         logger.info("Extraction will use upstream endpoint")
     # Log storage stats
     stats = storage.get_stats()
     logger.info(
-        f"Storage: ChromaDB facts={stats['chromadb']['facts']}, recipes={stats['chromadb']['recipes']}, "
+        f"Storage: ChromaDB facts={stats['chromadb']['facts']}, "
+        f"recipes={stats['chromadb']['recipes']}, "
         f"CogDB entities={stats['cogdb']['entities']}"
     )
     yield
@@ -291,7 +295,9 @@ async def clear_storage() -> dict[str, Any]:
     """Clear all stored data from ChromaDB and CogDB."""
     result = storage.clear_all()
     logger.info(
-        f"Storage cleared: facts={result['cleared']['facts']}, recipes={result['cleared']['recipes']}, entities={result['cleared']['entities']}"
+        f"Storage cleared: facts={result['cleared']['facts']}, "
+        f"recipes={result['cleared']['recipes']}, "
+        f"entities={result['cleared']['entities']}"
     )
     return result
 

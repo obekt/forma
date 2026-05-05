@@ -2,7 +2,6 @@
 
 import json
 import logging
-import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -48,7 +47,9 @@ class ExtractionResult:
         try:
             # Parse entities - look for lines with (type) pattern
             entities_section = re.search(
-                r"=== ENTITIES ===\n(.*?)(?==== RELATIONSHIPS ===|=== FACTS ===|=== RECIPES ===|=== ENTITIES_QUERY ===|=== END ===|$)",
+                r"=== ENTITIES ===\n(.*?)"
+                r"(?==== RELATIONSHIPS ===|=== FACTS ===|=== RECIPES ===|"
+                r"=== ENTITIES_QUERY ===|=== END ===|$)",
                 response,
                 re.DOTALL,
             )
@@ -75,7 +76,9 @@ class ExtractionResult:
 
             # Parse relationships - look for lines with -> pattern
             rels_section = re.search(
-                r"=== RELATIONSHIPS ===\n(.*?)(?==== FACTS ===|=== RECIPES ===|=== ENTITIES_QUERY ===|=== END ===|$)",
+                r"=== RELATIONSHIPS ===\n(.*?)"
+                r"(?==== FACTS ===|=== RECIPES ===|=== ENTITIES_QUERY ===|"
+                r"=== END ===|$)",
                 response,
                 re.DOTALL,
             )
@@ -90,12 +93,14 @@ class ExtractionResult:
                     # Format: Subject -> predicate -> Object confidence: 0.9
                     # Need to capture object before confidence suffix
                     match = re.match(
-                        r"[\[\(]?([^\[\]\(\)]+)[\]\)]?\s*->\s*(.+?)\s*->\s*[\[\(]?([^\[\]\(\)]+)[\]\)]?\s*(?:confidence:\s*([\d.]+))?",
+                        r"[\[\(]?([^\[\]\(\)]+)[\]\)]?\s*->\s*(.+?)\s*->\s*"
+                        r"[\[\(]?([^\[\]\(\)]+)[\]\)]?\s*(?:confidence:\s*([\d.]+))?",
                         line,
                     )
                     if match:
                         confidence = float(match.group(4)) if match.group(4) else 0.9
-                        # Clean predicate and object - remove trailing confidence if accidentally captured
+                        # Clean predicate and object
+                        # remove trailing confidence if accidentally captured
                         predicate = match.group(2).strip()
                         object = match.group(3).strip()
                         # Remove any "confidence: X.X" that might be in predicate/object
@@ -173,7 +178,9 @@ class ExtractionResult:
 
             # Parse recipes - procedural knowledge as plain text
             recipes_section = re.search(
-                r"=== RECIPES ===\n(.*?)(?==== ENTITIES_QUERY ===|=== FACT_QUERY ===|=== RECIPE_QUERY ===|=== END ===|$)",
+                r"=== RECIPES ===\n(.*?)"
+                r"(?==== ENTITIES_QUERY ===|=== FACT_QUERY ===|"
+                r"=== RECIPE_QUERY ===|=== END ===|$)",
                 response,
                 re.DOTALL,
             )
@@ -208,7 +215,8 @@ class ExtractionResult:
 
             # Parse entities query - list of entity names to query
             entities_query_section = re.search(
-                r"=== ENTITIES_QUERY ===\n(.*?)(?==== FACT_QUERY ===|=== RECIPE_QUERY ===|=== END ===|$)",
+                r"=== ENTITIES_QUERY ===\n(.*?)"
+                r"(?==== FACT_QUERY ===|=== RECIPE_QUERY ===|=== END ===|$)",
                 response,
                 re.DOTALL,
             )
@@ -358,7 +366,9 @@ class Extractor:
             with open(log_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(log_entry) + "\n")
             logger.debug(
-                f"Logged extraction: {len(result.entities)} entities, {len(result.relationships)} relationships, {len(result.facts)} facts"
+                f"Logged extraction: {len(result.entities)} entities, "
+                f"{len(result.relationships)} relationships, "
+                f"{len(result.facts)} facts"
             )
         except Exception as e:
             logger.error(f"Failed to log extraction: {e}")

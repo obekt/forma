@@ -2,7 +2,7 @@
 
 import json
 import logging
-from typing import Any
+from typing import Any, cast
 
 import httpx
 from fastapi import HTTPException, status
@@ -76,7 +76,7 @@ class OpenAIProxy:
                     json=payload,
                 )
                 response.raise_for_status()
-                return response.json()
+                return cast(dict[str, Any], response.json())
             except httpx.TimeoutException as e:
                 logger.error(f"Upstream timeout: {e}")
                 raise HTTPException(
@@ -199,7 +199,7 @@ class OpenAIProxy:
                     json=payload,
                 )
                 response.raise_for_status()
-                return response.json()
+                return cast(dict[str, Any], response.json())
             except httpx.TimeoutException as e:
                 logger.error(f"Embedding endpoint timeout: {e}")
                 raise HTTPException(
@@ -270,8 +270,8 @@ class OpenAIProxy:
                     json=payload,
                 )
                 response.raise_for_status()
-                data = response.json()
-                return data["choices"][0]["message"]["content"]
+                data = cast(dict[str, Any], response.json())
+                return cast(str, data["choices"][0]["message"]["content"])
             except httpx.TimeoutException as e:
                 logger.error(f"Extraction endpoint timeout: {e}")
                 raise HTTPException(

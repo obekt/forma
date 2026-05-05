@@ -48,3 +48,7 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 [tool.mypy]
 python_version = "3.11"
 strict = true
+
+[[tool.mypy.overrides]]
+module = ["cog", "cog.torque", "cog.config"]
+ignore_missing_imports = true
