@@ -180,7 +180,6 @@ class OpenAIProxy:
         model: str | None = None,
         max_tokens: int = 2048,
         temperature: float = 0.1,
-        disable_reasoning: bool = True,
     ) -> str:
         """
         Call extraction LLM for entity/relationship/fact extraction.
@@ -193,7 +192,6 @@ class OpenAIProxy:
             model: Model name (defaults to settings.extractor_model_name)
             max_tokens: Maximum tokens in response
             temperature: Sampling temperature (low for deterministic extraction)
-            disable_reasoning: Disable reasoning/thinking output for faster response
 
         Returns:
             Extraction result as string
@@ -208,9 +206,8 @@ class OpenAIProxy:
             "temperature": temperature,
         }
 
-        # Disable reasoning/thinking for faster extraction
-        if disable_reasoning:
-            # Try common parameters for disabling reasoning
+        # Add reasoning parameters only if configured (not supported by all APIs)
+        if self.settings.extractor_send_reasoning_params:
             payload["reasoning_effort"] = "none"
             payload["enable_thinking"] = False
 

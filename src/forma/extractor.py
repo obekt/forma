@@ -346,7 +346,6 @@ class Extractor:
             messages=messages,
             max_tokens=512,  # Lower since no reasoning output
             temperature=0.1,
-            disable_reasoning=True,
         )
 
         # Parse result

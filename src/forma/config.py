@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     extractor_api_key: str = ""  # Empty = no auth for extraction endpoint
     extractor_model_name: str = ""  # Model for extraction tasks
     extractor_timeout: float = 120.0  # 2 minutes for extraction (may need more time)
+    extractor_send_reasoning_params: bool = (
+        False  # Send reasoning_effort/enable_thinking params (not supported by all APIs)
+    )
 
     # GrafitoDB configuration (SQLite-backed graph + vector database)
     # Single file database - minimal file descriptors
