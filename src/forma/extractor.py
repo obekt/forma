@@ -1,4 +1,4 @@
-"""Extraction system for entities, relationships, and facts."""
+"""Extraction system for relationships, facts, and recipes."""
 
 import contextlib
 import json
@@ -20,9 +20,9 @@ LOGS_DIR = Path(__file__).parent.parent.parent / "logs"
 class ExtractionResult:
     """Structured extraction result."""
 
-    def __init__(self, raw_response: str) -> None:
+    def __init__(self, raw_response: str, extraction_prompt: str = "") -> None:
         self.raw_response = raw_response
-        self.entities: list[dict[str, Any]] = []
+        self.extraction_prompt = extraction_prompt
         self.relationships: list[dict[str, Any]] = []
         self.facts: list[dict[str, Any]] = []
         self.recipes: list[dict[str, Any]] = []
@@ -37,7 +37,7 @@ class ExtractionResult:
         response = self.raw_response
 
         # Parse text format
-        if "=== ENTITIES ===" in response:
+        if "=== RELATIONSHIPS ===" in response:
             self._parse_text_format(response)
         else:
             self.parse_error = "No valid format found in response"
@@ -81,28 +81,6 @@ class ExtractionResult:
 
                 return results
 
-            # Parse entities - Format: Name (type) on line 1, confidence on line 2
-            entities_section = re.search(
-                r"=== ENTITIES ===\n(.*?)"
-                r"(?==== RELATIONSHIPS ===|=== FACTS ===|=== RECIPES ===|"
-                r"=== ENTITIES_QUERY ===|=== END ===|$)",
-                response,
-                re.DOTALL,
-            )
-            if entities_section:
-                blocks = parse_blocks(entities_section.group(1))
-                for content, confidence in blocks:
-                    # Format: [Name] (type) or Name (type) - brackets optional
-                    match = re.match(r"\[?([^\[\]\(\)]+)\]?\s*\(([^)]+)\)", content)
-                    if match:
-                        self.entities.append(
-                            {
-                                "name": match.group(1).strip(),
-                                "type": match.group(2).strip().lower(),
-                                "confidence": max(0.0, min(1.0, confidence)),
-                            }
-                        )
-
             # Parse relationships - Format: Subject -> predicate -> Object on line 1
             rels_section = re.search(
                 r"=== RELATIONSHIPS ===\n(.*?)"
@@ -145,9 +123,7 @@ class ExtractionResult:
                     # Skip if content is empty or N/A
                     if content.upper() == "N/A":
                         continue
-                    # Skip lines that look like entities or relationships
-                    if "(" in content and re.search(r"\([^)]+\)", content):
-                        continue
+                    # Skip lines that look like relationships
                     if "->" in content:
                         continue
                     self.facts.append(
@@ -158,7 +134,7 @@ class ExtractionResult:
                     )
 
             # Parse recipes - Format: Multi-line description, confidence at end
-            # Recipes can span multiple lines, unlike entities/relationships/facts
+            # Recipes can span multiple lines, unlike relationships/facts
             recipes_section = re.search(
                 r"=== RECIPES ===\n(.*?)"
                 r"(?==== ENTITIES_QUERY ===|=== FACT_QUERY ===|"
@@ -268,8 +244,7 @@ class ExtractionResult:
     def is_valid(self) -> bool:
         """Check if extraction produced valid results."""
         return self.parse_error is None and (
-            len(self.entities) > 0
-            or len(self.relationships) > 0
+            len(self.relationships) > 0
             or len(self.facts) > 0
             or len(self.recipes) > 0
             or len(self.entities_queries) > 0
@@ -280,7 +255,6 @@ class ExtractionResult:
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for logging/storage."""
         return {
-            "entities": self.entities,
             "relationships": self.relationships,
             "facts": self.facts,
             "recipes": self.recipes,
@@ -300,7 +274,7 @@ class ExtractionResult:
 
 
 class Extractor:
-    """Handles extraction of entities, relationships, and facts from text."""
+    """Handles extraction of relationships, facts, and recipes from text."""
 
     def __init__(self, settings: Settings, proxy: Any = None) -> None:
         self.settings = settings
@@ -331,7 +305,7 @@ class Extractor:
 
     def extract_from_text(self, text: str) -> ExtractionResult:
         """
-        Extract entities, relationships, and facts from text.
+        Extract relationships, facts, and recipes from text.
 
         Note: This is a synchronous wrapper for async extraction.
         Use extract_from_text_async for proper async operation.
@@ -359,7 +333,8 @@ class Extractor:
         )
 
         # Parse result
-        result = ExtractionResult(response)
+        prompt_content = messages[0].get("content", "")
+        result = ExtractionResult(response, extraction_prompt=prompt_content)
 
         # Log extraction
         self._log_extraction(text, result)
@@ -384,9 +359,8 @@ class Extractor:
             self._log_file.write(json.dumps(log_entry) + "\n")
             self._log_file.flush()
             logger.debug(
-                f"Logged extraction: {len(result.entities)} entities, "
-                f"{len(result.relationships)} relationships, "
-                f"{len(result.facts)} facts"
+                f"Logged extraction: {len(result.relationships)} relationships, "
+                f"{len(result.facts)} facts, {len(result.recipes)} recipes"
             )
         except Exception as e:
             logger.error(f"Failed to log extraction: {e}")

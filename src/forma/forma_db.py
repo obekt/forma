@@ -111,6 +111,12 @@ class FormaDatabase:
         """Initialize database schema."""
         with self._transaction() as conn:
             conn.executescript(self.SCHEMA)
+            # Add extraction_prompt column if it doesn't exist (migration)
+            try:
+                conn.execute("ALTER TABLE requests ADD COLUMN extraction_prompt TEXT")
+            except sqlite3.OperationalError:
+                # Column already exists, ignore
+                pass
         logger.info(f"Forma database initialized at {self.db_path}")
 
     def _prune_old_records(self):
@@ -176,6 +182,7 @@ class FormaDatabase:
         user_prompt: str,
         messages: list[dict],
         extraction_response: str = "",
+        extraction_prompt: str = "",
         extraction_ms: float = 0.0,
         augmented_prompt: str = "",
         agent_response: str = "",
@@ -193,8 +200,9 @@ class FormaDatabase:
             conn.execute(
                 """
                 INSERT INTO requests (id, model, user_prompt, history, extraction_response,
-                                      extraction_ms, augmented_prompt, agent_response, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                      extraction_prompt, extraction_ms, augmented_prompt,
+                                      agent_response, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     request_id,
@@ -202,6 +210,7 @@ class FormaDatabase:
                     user_prompt,
                     history,
                     extraction_response,
+                    extraction_prompt,
                     extraction_ms,
                     augmented_prompt,
                     agent_response,
@@ -236,7 +245,6 @@ class FormaDatabase:
     def record_extractions_batch(
         self,
         request_id: str,
-        entities: list[dict],
         relationships: list[dict],
         facts: list[dict],
         recipes: list[dict],
@@ -248,16 +256,6 @@ class FormaDatabase:
         """
         count = 0
         with self._transaction() as conn:
-            for entity in entities:
-                extraction_id = str(uuid.uuid4())
-                data = self._format_extraction_data(entity, "entity")
-                confidence = entity.get("confidence", 0.9)
-                conn.execute(
-                    "INSERT INTO extractions (id, request_id, extraction_type, data, confidence) VALUES (?, ?, ?, ?, ?)",
-                    (extraction_id, request_id, "entity", data, confidence),
-                )
-                count += 1
-
             for rel in relationships:
                 extraction_id = str(uuid.uuid4())
                 data = self._format_extraction_data(rel, "relationship")

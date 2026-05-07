@@ -31,6 +31,7 @@ export interface RequestDetail {
   user_prompt: string;
   history: string;
   extraction_response: string;
+  extraction_prompt: string;
   extraction_ms: number;
   augmented_prompt: string;
   agent_response: string;
@@ -52,14 +53,12 @@ export interface RetrievalItem {
 }
 
 export interface ExtractionsByType {
-  entity?: ExtractionItem[];
   relationship?: ExtractionItem[];
   fact?: ExtractionItem[];
   recipe?: ExtractionItem[];
 }
 
 export interface RetrievalsByType {
-  entity?: RetrievalItem[];
   relationship?: RetrievalItem[];
   fact?: RetrievalItem[];
   recipe?: RetrievalItem[];

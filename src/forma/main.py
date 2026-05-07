@@ -89,7 +89,6 @@ def _log_context_retrieval(
 
 
 async def _store_extraction_background(
-    entities: list[dict[str, Any]],
     relationships: list[dict[str, Any]],
     facts: list[dict[str, Any]],
     recipes: list[dict[str, Any]],
@@ -97,11 +96,10 @@ async def _store_extraction_background(
     """Background task to store extracted data."""
     async with _storage_lock:
         try:
-            if entities or relationships or facts or recipes:
-                storage.store_extraction(entities, relationships, facts, recipes)
+            if relationships or facts or recipes:
+                storage.store_extraction(relationships, facts, recipes)
                 logger.info(
-                    f"Stored (background): {len(entities)} entities, "
-                    f"{len(relationships)} relationships, "
+                    f"Stored (background): {len(relationships)} relationships, "
                     f"{len(facts)} facts, {len(recipes)} recipes"
                 )
         except Exception as e:
@@ -149,7 +147,7 @@ async def lifespan(app: FastAPI) -> Any:
     # Log storage stats
     stats = storage.get_stats()
     logger.info(
-        f"Storage: GrafitoDB entities={stats['grafitodb']['entities']}, "
+        f"Storage: GrafitoDB nodes={stats['grafitodb']['nodes']}, "
         f"relationships={stats['grafitodb']['relationships']}, "
         f"facts={stats['grafitodb']['facts']}, "
         f"recipes={stats['grafitodb']['recipes']}"
@@ -216,17 +214,18 @@ async def list_models() -> dict[str, Any]:
 
 
 def _get_user_prompt(messages: list[dict]) -> str:
-    """Extract the user prompt from messages."""
+    """Extract the LAST user prompt from messages."""
+    last_user_content = ""
     for msg in messages:
         if msg.get("role") == "user":
             content = msg.get("content", "")
             if isinstance(content, str):
-                return content
+                last_user_content = content
             elif isinstance(content, list):
                 for part in content:
                     if isinstance(part, dict) and part.get("type") == "text":
-                        return part.get("text", "")
-    return ""
+                        last_user_content = part.get("text", "")
+    return last_user_content
 
 
 def _get_agent_response(response: dict) -> str:
@@ -246,7 +245,7 @@ async def chat_completions(request: Request) -> dict[str, Any] | StreamingRespon
     Create chat completion with extraction, retrieval, and RAG context.
 
     Pipeline:
-    1. Extract entities/facts/recipes/queries from messages
+    1. Extract relationships/facts/recipes/queries from messages
     2. Retrieve context from storage using extracted queries
     3. Augment prompt with retrieved context
     4. Forward to upstream model
@@ -269,7 +268,7 @@ async def chat_completions(request: Request) -> dict[str, Any] | StreamingRespon
     # Get user prompt for tracking
     user_prompt = _get_user_prompt(messages)
 
-    # Step 1: Extract entities, facts, recipes, and queries
+    # Step 1: Extract relationships, facts, recipes, and queries
     if messages and extractor.settings.extractor_model_name:
         try:
             extraction_start = time.time()
@@ -280,8 +279,7 @@ async def chat_completions(request: Request) -> dict[str, Any] | StreamingRespon
 
             if result.is_valid():
                 logger.info(
-                    f"Extraction complete: {len(result.entities)} entities, "
-                    f"{len(result.relationships)} relationships, "
+                    f"Extraction complete: {len(result.relationships)} relationships, "
                     f"{len(result.facts)} facts, {len(result.recipes)} recipes"
                 )
                 extraction_result = result
@@ -381,11 +379,15 @@ async def chat_completions(request: Request) -> dict[str, Any] | StreamingRespon
     # Step 6: Record request for web UI (if database enabled)
     if db:
         try:
+            extraction_prompt_text = (
+                extraction_result.extraction_prompt if extraction_result else ""
+            )
             request_id = db.record_request(
                 model=model,
                 user_prompt=user_prompt,
                 messages=messages,
                 extraction_response=extraction_response,
+                extraction_prompt=extraction_prompt_text,
                 extraction_ms=extraction_latency,
                 augmented_prompt=augmented_prompt,
                 agent_response=agent_response,
@@ -395,7 +397,6 @@ async def chat_completions(request: Request) -> dict[str, Any] | StreamingRespon
             if extraction_result:
                 db.record_extractions_batch(
                     request_id=request_id,
-                    entities=extraction_result.entities,
                     relationships=extraction_result.relationships,
                     facts=extraction_result.facts,
                     recipes=extraction_result.recipes,
@@ -411,14 +412,12 @@ async def chat_completions(request: Request) -> dict[str, Any] | StreamingRespon
             logger.error(f"Database recording error: {e}")
 
     # Step 7: Store all extracted data in background (fire-and-forget)
-    entities = extraction_result.entities if extraction_result else []
     relationships = extraction_result.relationships if extraction_result else []
     facts = extraction_result.facts if extraction_result else []
     recipes = extraction_result.recipes if extraction_result else []
-    if entities or relationships or facts or recipes:
+    if relationships or facts or recipes:
         asyncio.create_task(
             _store_extraction_background(
-                entities,
                 relationships,
                 facts,
                 recipes,

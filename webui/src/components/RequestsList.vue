@@ -79,38 +79,6 @@
                   </h4>
                 </div>
                 <div v-if="sectionsExpanded[request.id]?.extractions" class="collapsible-content">
-                  <!-- Entities -->
-                  <div
-                    v-if="details[request.id].extractions.entity?.length"
-                    class="sub-section"
-                  >
-                    <strong>Entities</strong>
-                    <table class="detail-table">
-                      <thead>
-                        <tr>
-                          <th>Data</th>
-                          <th>Confidence</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        <tr
-                          v-for="item in details[request.id].extractions.entity"
-                          :key="item.id"
-                        >
-                          <td>{{ item.data }}</td>
-                          <td>
-                            <span
-                              class="confidence-badge"
-                              :class="getConfidenceClass(item.confidence)"
-                            >
-                              {{ Math.round(item.confidence * 100) }}%
-                            </span>
-                          </td>
-                        </tr>
-                      </tbody>
-                    </table>
-                  </div>
-
                   <!-- Relationships -->
                   <div
                     v-if="details[request.id].extractions.relationship?.length"
@@ -204,6 +172,22 @@
                     </table>
                   </div>
 
+                  <!-- Extraction Full Prompt (Collapsible within Extractions) -->
+                  <div
+                    class="sub-section collapsible"
+                    v-if="details[request.id].request.extraction_prompt"
+                  >
+                    <div class="collapsible-header-sub clickable" @click="toggleSection(request.id, 'extractionPrompt')">
+                      <strong>
+                        <span class="collapse-icon">{{ sectionsExpanded[request.id]?.extractionPrompt ? "▼" : "▶" }}</span>
+                        Extraction Full Prompt
+                      </strong>
+                    </div>
+                    <div v-if="sectionsExpanded[request.id]?.extractionPrompt" class="collapsible-content">
+                      <div class="prompt-box">{{ details[request.id].request.extraction_prompt }}</div>
+                    </div>
+                  </div>
+
                   <!-- Raw Extraction Output (Collapsible within Extractions) -->
                   <div
                     class="sub-section collapsible"
@@ -223,7 +207,7 @@
                 </div>
               </div>
 
-              <!-- 4. Retrievals (Collapsible) -->
+              <!-- 5. Retrievals (Collapsible) -->
               <div
                 class="detail-section collapsible"
                 v-if="hasAnyRetrievals(details[request.id].retrievals)"
@@ -390,7 +374,6 @@ const getConfidenceClass = (confidence: number): string => {
 
 const hasAnyExtractions = (extractions: ExtractionsByType): boolean => {
   return (
-    (extractions.entity?.length ?? 0) > 0 ||
     (extractions.relationship?.length ?? 0) > 0 ||
     (extractions.fact?.length ?? 0) > 0 ||
     (extractions.recipe?.length ?? 0) > 0
@@ -410,6 +393,7 @@ const hasAnyDetails = (detail: RequestFullDetail): boolean => {
     hasAnyExtractions(detail.extractions) ||
     hasAnyRetrievals(detail.retrievals) ||
     (detail.request.extraction_response?.length ?? 0) > 0 ||
+    (detail.request.extraction_prompt?.length ?? 0) > 0 ||
     (detail.request.augmented_prompt?.length ?? 0) > 0 ||
     (detail.request.user_prompt?.length ?? 0) > 0
   );
@@ -432,6 +416,7 @@ const toggleExpand = async (requestId: string) => {
       // Initialize sections as collapsed by default
       sectionsExpanded[requestId] = {
         extractions: false,
+        extractionPrompt: false,
         rawExtraction: false,
         retrievals: false,
       };

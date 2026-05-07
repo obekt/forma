@@ -4,15 +4,14 @@ Autonomous Cognitive Proxy and Hybrid RAG System
 
 ## Overview
 
-Forma is an OpenAI-compatible proxy that augments conversations with retrieved context from a hybrid memory system. It automatically extracts entities, facts, and procedural knowledge from conversations, stores them in GrafitoDB (SQLite-backed graph + vector database), and retrieves relevant context to augment future queries.
+Forma is an OpenAI-compatible proxy that augments conversations with retrieved context from a hybrid memory system. It automatically extracts relationships, facts, and procedural knowledge from conversations, stores them in GrafitoDB (SQLite-backed graph + vector database), and retrieves relevant context to augment future queries.
 
 ### How It Works
 
 For each chat completion request, Forma executes this pipeline:
 
 1. **Extract** - Analyzes the conversation to extract:
-   - Entities (people, organizations, concepts, technologies, etc.)
-   - Relationships between entities
+   - Relationships between entities (entities are auto-created as nodes)
    - Factual statements
    - Procedural knowledge (recipes/how-to guides)
    - Queries for retrieval
@@ -45,7 +44,7 @@ Forma uses **GrafitoDB** - a SQLite-backed database that combines graph and vect
 
 | Data Type | Storage | Why |
 |-----------|---------|-----|
-| Entities & Relationships | Graph (GrafitoDB) | Efficient traversal of entity connections |
+| Entity Nodes & Relationships | Graph (GrafitoDB) | Efficient traversal of entity connections (nodes created automatically from relationships) |
 | Facts & Recipes | Vector Index (GrafitoDB) | Semantic similarity search |
 | Upstreams & Request History | SQLite (Forma DB) | System configuration and tracking |
 
@@ -72,7 +71,7 @@ Forma includes a Vue 3 SPA Web UI for visualizing requests, extractions, retriev
 
 - **Dashboard**: Overview of system activity
 - **Requests List**: Browse recent requests with detailed information
-- **Extractions View**: See entities, relationships, facts, and recipes extracted from each request
+- **Extractions View**: See relationships, facts, and recipes extracted from each request
 - **Retrievals View**: See context retrieved for augmentation with confidence and scores
 - **Upstreams**: Configure upstream API endpoints with model name mapping
 - **Chat**: Interactive chat interface with streaming responses and automatic context compaction
@@ -121,10 +120,10 @@ This approach (similar to OpenCode) ensures conversations can continue indefinit
 ### Request Detail Sections
 
 Each request shows:
-- Original Prompt
+- Original Prompt (last user message)
 - Augmented Prompt (with retrieved context)
 - Agent Response
-- Extractions (collapsible): Entities, Relationships, Facts, Recipes
+- Extractions (collapsible): Relationships, Facts, Recipes, and Extraction Full Prompt
 - Retrievals (collapsible): Facts and Recipes with Confidence and Score columns
 
 ## Quick Start
@@ -200,7 +199,7 @@ Edit `.env` to configure. Upstreams are configured via the Web UI, not in `.env`
 
 ### Extraction LLM
 
-LLM used internally for extracting entities/facts/recipes:
+LLM used internally for extracting relationships/facts/recipes:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -298,7 +297,7 @@ The Web UI Chat interface uses the `/v1/chat/completions` endpoint with streamin
 | Endpoint | Description |
 |----------|-------------|
 | `POST /admin/clear` | Clear all stored data from GrafitoDB |
-| `GET /admin/stats` | Get storage statistics (facts, recipes, entities counts) |
+| `GET /admin/stats` | Get storage statistics (nodes, facts, recipes counts) |
 
 Example:
 
@@ -345,8 +344,7 @@ The `ChatMessage` type includes:
 
 Forma uses a structured extraction prompt to extract:
 
-- **Entities**: Named entities (people, organizations, locations) and conceptual entities (technologies, methodologies, tools, models, datasets)
-- **Relationships**: Connections between entities (subject → predicate → object)
+- **Relationships**: Connections between entities (subject → predicate → object). Entity nodes are created automatically when relationships are stored.
 - **Facts**: Standalone factual statements (first-person pronouns transformed to "The user")
 - **Recipes**: Procedural knowledge (how-to guides, workflows, methods)
 - **Queries**: Natural language queries for retrieval
@@ -394,7 +392,7 @@ Forma logs extraction and retrieval operations:
 
 | Log File | Description |
 |----------|-------------|
-| `logs/extractions.jsonl` | Extraction results (entities, facts, recipes extracted) |
+| `logs/extractions.jsonl` | Extraction results (relationships, facts, recipes extracted) |
 | `logs/retrievals.jsonl` | Retrieval results (context retrieved for augmentation) |
 | `server.log` | Server output (managed by `server.sh`) |
 
@@ -455,7 +453,7 @@ GrafitoDB provides:
 
 | Stage | Input | Output |
 |-------|-------|--------|
-| **Extract** | Messages | Entities, relationships, facts, recipes, queries |
+| **Extract** | Messages | Relationships, facts, recipes, queries (entity nodes created automatically) |
 | **Retrieve** | Queries | Context from GrafitoDB (graph + vector) |
 | **Augment** | Context + Prompt | Augmented user message |
 | **Forward** | Augmented request | Upstream API response |
@@ -470,7 +468,7 @@ forma/
 ├── src/forma/
 │   ├── main.py              # FastAPI application entry point
 │   ├── config.py            # Configuration management
-│   ├── extractor.py         # Entity/fact/recipe extraction
+│   ├── extractor.py         # Relationship/fact/recipe extraction
 │   ├── storage.py           # GrafitoDB storage backend
 │   ├── forma_db.py          # Forma database (upstreams + request history)
 │   ├── upstream_manager.py  # Multi-upstream routing
@@ -495,7 +493,7 @@ forma/
 ├── data/                    # Forma database
 │   └── forma.db             # Upstreams + request history
 ├── grafito_data/            # GrafitoDB database
-│   └── forma.db             # Entities, relationships, facts, recipes
+│   └── forma.db             # Entity nodes, relationships, facts, recipes
 ├── models/                  # Cached embedding models
 ├── logs/                    # Runtime logs
 │   ├── extractions.jsonl

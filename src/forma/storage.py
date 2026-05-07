@@ -22,7 +22,7 @@ CHARS_PER_TOKEN = 4
 
 
 class Storage:
-    """Manages GrafitoDB for all data: entities, relationships, facts, recipes."""
+    """Manages GrafitoDB for relationships, facts, and recipes."""
 
     def __init__(
         self,
@@ -187,72 +187,6 @@ class Storage:
         if len(desc) > 200:
             desc = desc[:200] + "..."
         return f"- {desc}"
-
-    def store_entities(self, entities: list[dict[str, Any]]) -> int:
-        """
-        Store entities in GrafitoDB as nodes.
-
-        Each entity is stored as a node with:
-        - labels: ["Entity", entity_type]
-        - properties: {name, confidence, extracted_at}
-
-        Returns number of entities stored.
-        """
-        if not entities:
-            return 0
-
-        timestamp = datetime.utcnow().isoformat()
-        count = 0
-
-        for entity in entities:
-            name = entity.get("name", "")
-            entity_type = entity.get("type", "other")
-            confidence = entity.get("confidence", 0.9)
-
-            if not name.strip():
-                continue
-
-            try:
-                # Check if entity already exists
-                existing = self.db.match_nodes(
-                    labels=["Entity"],
-                    properties={"name": name},
-                    limit=1,
-                )
-                if existing:
-                    # Update existing entity
-                    node = existing[0]
-                    self.db.update_node_properties(
-                        node.id,
-                        {
-                            "confidence": max(
-                                float(node.properties.get("confidence", 0.9)), confidence
-                            ),
-                            "extracted_at": timestamp,
-                        },
-                    )
-                    # Update labels if type changed
-                    current_labels = list(node.labels)
-                    if entity_type not in current_labels:
-                        self.db.add_labels(node.id, [entity_type])
-                else:
-                    # Create new entity node
-                    self.db.create_node(
-                        labels=["Entity", entity_type],
-                        properties={
-                            "name": name,
-                            "confidence": confidence,
-                            "extracted_at": timestamp,
-                        },
-                    )
-                count += 1
-            except Exception as e:
-                logger.debug(f"Error storing entity '{name}': {e}")
-
-        if count > 0:
-            logger.info(f"Stored {count} entities to GrafitoDB")
-
-        return count
 
     def store_relationships(self, relationships: list[dict[str, Any]]) -> int:
         """
@@ -518,21 +452,19 @@ class Storage:
 
     def store_extraction(
         self,
-        entities: list[dict[str, Any]],
         relationships: list[dict[str, Any]],
         facts: list[dict[str, Any]],
         recipes: list[dict[str, Any]],
-    ) -> tuple[int, int, int, int]:
+    ) -> tuple[int, int, int]:
         """
         Store all extracted data.
 
-        Returns tuple of (entities_count, relationships_count, facts_count, recipes_count).
+        Returns tuple of (relationships_count, facts_count, recipes_count).
         """
-        entities_count = self.store_entities(entities)
         relationships_count = self.store_relationships(relationships)
         facts_count = self.store_facts(facts)
         recipes_count = self.store_recipes(recipes)
-        return (entities_count, relationships_count, facts_count, recipes_count)
+        return (relationships_count, facts_count, recipes_count)
 
     def query_facts(self, query: str, n_results: int = 10) -> list[dict[str, Any]]:
         """
@@ -755,7 +687,7 @@ class Storage:
 
     def get_stats(self) -> dict[str, Any]:
         """Get stats from GrafitoDB."""
-        entity_count = self.db.get_node_count()
+        node_count = self.db.get_node_count()
         relationship_count = self.db.get_relationship_count()
 
         # Count facts and recipes by label
@@ -764,7 +696,7 @@ class Storage:
 
         return {
             "grafitodb": {
-                "entities": entity_count,
+                "nodes": node_count,
                 "relationships": relationship_count,
                 "facts": len(facts_nodes),
                 "recipes": len(recipes_nodes),

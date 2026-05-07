@@ -84,6 +84,7 @@ async def get_request_detail(request_id: str):
         "user_prompt": request["user_prompt"],
         "history": request["history"],
         "extraction_response": request["extraction_response"],
+        "extraction_prompt": request.get("extraction_prompt", ""),
         "extraction_ms": request["extraction_ms"],
         "augmented_prompt": request["augmented_prompt"],
         "agent_response": request["agent_response"],
