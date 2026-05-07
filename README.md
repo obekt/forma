@@ -353,10 +353,6 @@ Forma uses a structured extraction prompt to extract:
 
 The extraction prompt is located at `src/forma/prompts/extraction.txt` and can be customized.
 
-### Assistant Response Extraction
-
-Forma also extracts facts from assistant responses, allowing the system to learn from model-generated information. This happens automatically for non-streaming responses.
-
 ## Model Caching
 
 Forma caches the SentenceTransformer embedding model locally:

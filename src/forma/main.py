@@ -378,20 +378,6 @@ async def chat_completions(request: Request) -> dict[str, Any] | StreamingRespon
     if isinstance(response, dict):
         agent_response = _get_agent_response(response)
 
-    # Step 5: Extract facts from assistant response (non-streaming only)
-    assistant_facts: list[dict[str, Any]] = []
-    if isinstance(response, dict) and agent_response and extractor.settings.extractor_model_name:
-        try:
-            logger.info("Extracting facts from assistant response...")
-            assistant_result = await extractor.extract_from_text_async(agent_response)
-            if assistant_result.facts:
-                logger.info(
-                    f"Extracted {len(assistant_result.facts)} facts from assistant response"
-                )
-                assistant_facts = assistant_result.facts
-        except Exception as e:
-            logger.error(f"Assistant response extraction error: {e}")
-
     # Step 6: Record request for web UI (if database enabled)
     if db:
         try:
@@ -411,7 +397,7 @@ async def chat_completions(request: Request) -> dict[str, Any] | StreamingRespon
                     request_id=request_id,
                     entities=extraction_result.entities,
                     relationships=extraction_result.relationships,
-                    facts=extraction_result.facts + assistant_facts,
+                    facts=extraction_result.facts,
                     recipes=extraction_result.recipes,
                 )
 
@@ -427,7 +413,7 @@ async def chat_completions(request: Request) -> dict[str, Any] | StreamingRespon
     # Step 7: Store all extracted data in background (fire-and-forget)
     entities = extraction_result.entities if extraction_result else []
     relationships = extraction_result.relationships if extraction_result else []
-    facts = (extraction_result.facts if extraction_result else []) + assistant_facts
+    facts = extraction_result.facts if extraction_result else []
     recipes = extraction_result.recipes if extraction_result else []
     if entities or relationships or facts or recipes:
         asyncio.create_task(
