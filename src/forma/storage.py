@@ -933,14 +933,43 @@ class Storage:
             "scores": scores,
         }
 
-    def format_context_for_prompt(self, context: dict[str, Any]) -> str:
+    def format_context_for_prompt(
+        self, context: dict[str, Any], available_tools: list[dict[str, Any]] | None = None
+    ) -> str:
         """
         Format retrieved context for prompt augmentation.
 
         Returns a formatted string suitable for prepending to user message.
+        Optionally includes tool instructions if tools are available.
+
+        Args:
+            context: Retrieved context (relationships, facts, recipes)
+            available_tools: Optional list of available tools in OpenAI format
         """
         lines: list[str] = []
 
+        # Add tool instructions if tools are available
+        if available_tools:
+            lines.append("Available tools you can use:")
+            for tool in available_tools:
+                if tool.get("type") == "function":
+                    func = tool.get("function", {})
+                    name = func.get("name", "")
+                    desc = func.get("description", "")
+                    lines.append(f"- {name}: {desc}")
+
+            lines.append("")
+            lines.append("Use tools when they would be helpful for answering the user's question.")
+            lines.append("")
+            lines.append("To use a tool, call it like a function in your response:")
+            lines.append("Example: get_current_time()")
+            lines.append('Example: search_web("recent Python tutorials")')
+            lines.append('Example: query_memory("python programming")')
+            lines.append("")
+            lines.append("Only use tools when necessary. For simple questions, answer directly.")
+            lines.append("")
+
+        # Add context from memory
         if context.get("relationships"):
             lines.append("Known relationships:")
             for rel in context["relationships"]:
@@ -959,5 +988,5 @@ class Storage:
                 lines.append(f"- {desc}")
 
         if lines:
-            return "Relevant context from memory:\n" + "\n".join(lines) + "\n\n"
+            return "\n".join(lines) + "\n\n"
         return ""

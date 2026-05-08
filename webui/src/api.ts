@@ -1,6 +1,6 @@
 /** API client for Forma Web UI */
 
-import type { Stats, RequestListItem, RequestFullDetail, Upstream, ChatMessage, ChatCompletionResponse } from "./types";
+import type { Stats, RequestListItem, RequestFullDetail, Upstream, ChatMessage, ChatCompletionResponse, ToolEvent } from "./types";
 
 const API_BASE = "/ui";
 const CHAT_API_BASE = "/v1";
@@ -116,6 +116,8 @@ export async function deleteUpstream(upstreamId: string): Promise<{ status: stri
  * @param model - Model name to use
  * @param messages - Chat messages
  * @param onChunk - Callback for each chunk of content
+ * @param onReasoningChunk - Callback for each chunk of reasoning content (optional)
+ * @param onToolEvent - Callback for tool execution events (optional)
  * @param onComplete - Callback when stream completes
  * @param onError - Callback for errors
  */
@@ -124,7 +126,9 @@ export async function streamChatCompletion(
   messages: ChatMessage[],
   onChunk: (chunk: string) => void,
   onComplete: () => void,
-  onError: (error: string) => void
+  onError: (error: string) => void,
+  onReasoningChunk?: (chunk: string) => void,
+  onToolEvent?: (event: ToolEvent) => void
 ): Promise<void> {
   const response = await fetch(`${CHAT_API_BASE}/chat/completions`, {
     method: "POST",
@@ -187,8 +191,38 @@ export async function streamChatCompletion(
           try {
             const parsed = JSON.parse(data);
             const content = parsed.choices?.[0]?.delta?.content;
+            const reasoningContent = parsed.choices?.[0]?.delta?.reasoning_content;
+            
             if (content) {
-              onChunk(content);
+              // Check for tool event markers
+              const toolEventRegex = /__TOOL_EVENT__(.+?)__END__/g;
+              let match;
+              let remainingContent = content;
+              
+              while ((match = toolEventRegex.exec(content)) !== null) {
+                // Parse the tool event JSON
+                try {
+                  const eventData = JSON.parse(match[1]) as ToolEvent;
+                  if (onToolEvent) {
+                    onToolEvent(eventData);
+                  }
+                } catch {
+                  // Ignore parse errors for tool events
+                }
+                // Remove the marker from remaining content
+                remainingContent = remainingContent.replace(match[0], "");
+              }
+              
+              // Send remaining content (without tool event markers)
+              // Don't trim - spaces are valid content
+              if (remainingContent) {
+                onChunk(remainingContent);
+              }
+            }
+            
+            // Handle reasoning content (DeepSeek R1 and similar models)
+            if (reasoningContent && onReasoningChunk) {
+              onReasoningChunk(reasoningContent);
             }
           } catch {
             // Ignore parse errors for malformed chunks

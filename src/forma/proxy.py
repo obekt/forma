@@ -196,11 +196,20 @@ class OpenAIProxy:
                 )
                 yield f"data: {error_data}\n\n".encode()
             except httpx.HTTPStatusError as e:
-                logger.error(f"Upstream stream error ({upstream.name}): {e.response.status_code}")
+                # For streaming responses, we need to read the content first
+                error_text = ""
+                try:
+                    content = await e.response.aread()
+                    error_text = content.decode("utf-8")
+                except Exception:
+                    error_text = f"HTTP {e.response.status_code}"
+                logger.error(
+                    f"Upstream stream error ({upstream.name}): {e.response.status_code} - {error_text}"
+                )
                 error_data = json.dumps(
                     {
                         "error": {
-                            "message": e.response.text,
+                            "message": error_text,
                             "type": "upstream_error",
                         }
                     }
@@ -242,6 +251,10 @@ class OpenAIProxy:
     async def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any] | StreamingResponse:
         """Forward chat completion request."""
         stream = payload.get("stream", False)
+
+        # Remove reasoning parameters - not supported by most upstreams
+        payload.pop("reasoning_effort", None)
+        payload.pop("enable_thinking", None)
 
         if stream:
             return await self.stream_request("POST", "/chat/completions", payload)

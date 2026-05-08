@@ -23,9 +23,81 @@ For each chat completion request, Forma executes this pipeline:
 
 3. **Augment** - Injects retrieved context into the prompt, giving the model access to information from previous conversations that may have been lost due to context window limits
 
-4. **Forward** - Sends the augmented request to the upstream model
+4. **Execute Tools** - (Optional) If tools are provided in the request, Forma executes them server-side:
+   - Model requests tool calls → Forma executes → Appends results → Continues conversation
+   - Seamless client experience: receive final response, not intermediate tool calls
 
-5. **Store** - Persists newly extracted data in background (async, fire-and-forget)
+5. **Forward** - Sends the augmented request to the upstream model
+
+6. **Store** - Persists newly extracted data in background (async, fire-and-forget)
+
+### Server-Side Tool Calling
+
+Forma supports server-side tool execution, allowing models to use tools without client intervention:
+
+```
+Client Request (with tools)
+    │
+    ▼
+Forma executes tools on server with real-time streaming
+    │
+    ▼
+Client receives final response (fully resolved)
+```
+
+**Benefits over client-side execution (MCP):**
+- Simple client integration - no tool management needed
+- Tools work with any OpenAI-compatible client
+- **Real-time streaming** - Tool execution events stream to client as they happen, not after completion
+- Seamless UX - Users see tool progress immediately, not after waiting for completion
+
+**Current tools:**
+- `echo` - Testing tool that echoes input
+- `search_web` - Web search using DuckDuckGo (returns titles, URLs, snippets)
+- `web_fetch` - Fetch content from URLs (HTML to markdown conversion)
+- `get_current_time` - Returns current date/time in UTC or specified timezone
+- `query_memory` - Direct query to Forma's GrafitoDB storage (relationships, facts, recipes)
+
+**Real-Time Streaming Architecture:**
+
+Tool execution events are streamed to the client using SSE (Server-Sent Events) with special markers:
+
+```
+Tool Start Event → sent immediately when tool call begins
+    │ (50ms delay to ensure delivery before execution)
+    ▼
+Tool Execution (e.g., web search ~1-2 seconds)
+    │
+    ▼
+Tool End Event → sent immediately when execution completes
+```
+
+Events use the marker format: `__TOOL_EVENT__{json}__END__` for UI parsing.
+
+**Event Types:**
+- `tool_loop_progress` - Iteration count (only when tools are used)
+- `tool_calls_received` - List of tools the model wants to call
+- `tool_call_start` - Individual tool starting execution
+- `tool_call_end` - Individual tool completed (with result preview)
+- `tool_loop_complete` - All tool iterations finished (control signal)
+
+Enable tools in `.env`:
+```env
+TOOLS_ENABLED=true
+TOOLS_MAX_ITERATIONS=5
+TOOLS_TIMEOUT=30.0
+```
+
+Tools are automatically injected into requests when enabled - clients don't need to specify them:
+
+```python
+response = client.chat.completions.create(
+    model="gemma-local",
+    messages=[{"role": "user", "content": "Search for Python async tutorials"}],
+    stream=True  # Streaming enables real-time tool event display
+)
+# Forma injects available tools automatically and streams execution events in real-time
+```
 
 ### Multi-Upstream Support
 
@@ -99,6 +171,10 @@ The Chat page (`http://localhost:8000/chat`) provides an interactive chat experi
 
 **Features:**
 - **Streaming Responses**: Assistant responses stream in real-time, showing content as it's generated
+- **Real-Time Tool Execution**: When tools are used, execution events stream immediately:
+  - Tool call starts are shown before execution completes
+  - Progress indicators display during tool execution
+  - Expandable tool results show full output after completion
 - **Context Compaction**: When token usage reaches 95% of the configured context size, older messages are automatically summarized
   - Summary appears at the end of the chat and remains visible
   - Keeps the most recent messages (last 4 messages = 2 exchanges)
@@ -106,6 +182,17 @@ The Chat page (`http://localhost:8000/chat`) provides an interactive chat experi
 - **Token Tracking**: Real-time token count display with visual progress bar
 - **Auto-Focus**: Input field automatically focuses after responses complete, allowing immediate typing of the next message
 - **Context Size Control**: Adjustable context window size (256-128000 tokens)
+
+**Tool Execution Display:**
+When the model uses tools (e.g., searching the web), the UI shows:
+- 🔧 **Tool call indicator** with execution count and time
+- **Expandable details** showing:
+  - Tool name and arguments
+  - Execution status (success/failed)
+  - Duration in milliseconds
+  - Full result preview
+
+This real-time feedback lets users see what's happening during long-running operations like web searches (~1-2 seconds), rather than waiting until completion.
 
 **Context Compaction Details:**
 When context reaches the threshold, Forma:
@@ -210,6 +297,22 @@ LLM used internally for extracting relationships/facts/recipes:
 | `EXTRACTOR_SEND_REASONING_PARAMS` | `false` | Send reasoning_effort/enable_thinking params (not supported by all APIs) |
 
 If `EXTRACTOR_BASE_URL` is empty, Forma will use the upstream configured for `EXTRACTOR_MODEL_NAME` in the database.
+
+### Tool Execution (Server-Side Tool Calling)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TOOLS_ENABLED` | `false` | Enable server-side tool execution |
+| `TOOLS_MAX_ITERATIONS` | `5` | Maximum tool call iterations per request |
+| `TOOLS_TIMEOUT` | `30.0` | Default timeout for tool execution (seconds) |
+
+When enabled, Forma:
+1. Automatically injects available tools into requests
+2. Executes tools requested by the model on the server
+3. Streams execution events in real-time to the client (SSE)
+4. Returns the final response after all tool iterations complete
+
+This differs from MCP where the client executes tools. The real-time streaming ensures users see tool progress immediately, not after waiting for completion.
 
 ### GrafitoDB Storage
 
@@ -431,11 +534,24 @@ cd webui && npm run build
 ### Request Pipeline
 
 ```
-Request → Extract → Retrieve → Augment → Forward → Response
-                                                      ↓
-                                               Background Store
-                                               (async, fire-and-forget)
+Request → Extract → Retrieve → Augment → Tool Loop (if enabled) → Forward → Response
+                                                          ↓
+                                                  Real-Time Event Stream
+                                                          ↓
+                                                   Background Store
+                                                   (async, fire-and-forget)
 ```
+
+When tools are enabled, the tool execution loop:
+1. Sends request to upstream with available tools
+2. Checks response for tool calls (OpenAI format or Gemma/LM Studio markup)
+3. Streams `tool_call_start` event immediately
+4. Executes tool (e.g., web search ~1-2 seconds)
+5. Streams `tool_call_end` event immediately with result
+6. Appends tool results to messages
+7. Repeats until no tool calls or max iterations
+8. Streams `tool_loop_complete` event (control signal)
+9. Proceeds to final response streaming
 
 ### Storage Backend
 
@@ -474,6 +590,18 @@ forma/
 │   ├── upstream_manager.py  # Multi-upstream routing
 │   ├── api.py               # Web UI API endpoints
 │   ├── proxy.py             # OpenAI API proxy with upstream routing
+│   ├── tools/               # Server-side tool execution
+│   │   ├── __init__.py      # Tool exports
+│   │   ├── base.py          # Tool base classes (Tool, ToolCall, ToolResult)
+│   │   ├── executor.py      # Tool execution loop with real-time events
+│   │   ├── registry.py      # Tool registry and registration
+│   │   └── builtin/         # Built-in tool implementations
+│   │       ├── __init__.py
+│   │       ├── echo.py      # Echo test tool
+│   │       ├── web_search.py # DuckDuckGo web search
+│   │       ├── web_fetch.py  # URL content fetching
+│   │       ├── time.py      # Current time retrieval
+│   │       └── memory.py    # GrafitoDB query tool
 │   └── prompts/
 │       └── extraction.txt   # Extraction prompt template
 ├── webui/                   # Vue 3 SPA frontend
@@ -483,9 +611,9 @@ forma/
 │   │   │   ├── RequestsList.vue
 │   │   │   ├── RequestDetail.vue
 │   │   │   ├── Upstreams.vue
-│   │   │   └── Chat.vue      # Interactive chat with streaming & compaction
-│   │   ├── api.ts           # API client (includes streaming chat completion)
-│   │   ├── types/           # TypeScript types (includes ChatMessage types)
+│   │   │   └── Chat.vue      # Interactive chat with streaming & real-time tools
+│   │   ├── api.ts           # API client (includes streaming with tool event parsing)
+│   │   ├── types/           # TypeScript types (includes ChatMessage, ToolEvent types)
 │   │   └── main.ts
 │   ├── package.json
 │   └ vite.config.ts
@@ -499,6 +627,8 @@ forma/
 │   ├── extractions.jsonl
 │   ├── retrievals.jsonl
 │   └ server.log
+├── docs/                    # Documentation
+│   └── tool_calling_design.md
 └── benchmarks/              # LongMemEval benchmark
 ```
 

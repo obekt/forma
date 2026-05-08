@@ -20,6 +20,8 @@ dependencies = [
     "pydantic-settings>=2.5.0",
     "python-dotenv>=1.0.0",
     "grafito>=0.1.2",
+    "duckduckgo-search>=6.0.0",  # For web search tool
+    "html2text>=2024.0.0",  # For web fetch tool - converts HTML to readable text
 ]
 
 [project.optional-dependencies]

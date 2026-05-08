@@ -25,9 +25,14 @@ class Settings(BaseSettings):
     extractor_api_key: str = ""  # Empty = no auth for extraction endpoint
     extractor_model_name: str = ""  # Model for extraction tasks (required)
     extractor_timeout: float = 120.0  # 2 minutes for extraction (may need more time)
-    extractor_send_reasoning_params: bool = (
-        False  # Send reasoning_effort/enable_thinking params (not supported by all APIs)
-    )
+    extractor_send_reasoning_params: bool = False  # Send reasoning_effort/enable_thinking params for extraction (not supported by all APIs)
+
+    # Main chat reasoning configuration
+    # Enable reasoning/thinking for main chat completions endpoint
+    reasoning_enabled: bool = True  # Enable reasoning support for chat completions
+    reasoning_send_params: bool = True  # Send reasoning_effort/enable_thinking params to upstream
+    reasoning_effort: str = "medium"  # Reasoning effort level: "low", "medium", "high"
+    reasoning_display_collapsed: bool = True  # Default display state for reasoning in web UI
 
     # GrafitoDB configuration (SQLite-backed graph + vector database)
     grafitodb_path: str = "./grafito_data/forma.db"  # SQLite database file path
@@ -39,6 +44,12 @@ class Settings(BaseSettings):
     forma_db_path: str = "./data/forma.db"  # SQLite database for system data
     history_max_records: int = 100  # Maximum request history records to keep
     history_enabled: bool = True  # Enable request history for web UI
+
+    # Tool execution configuration (server-side tool calling)
+    tools_enabled: bool = False  # Enable server-side tool execution
+    tools_max_iterations: int = 5  # Maximum tool call iterations per request
+    tools_timeout: float = 30.0  # Default timeout for tool execution (seconds)
+    tools_stream_events: bool = False  # Stream tool execution events to client (Phase 4)
 
 
 @lru_cache

@@ -101,9 +101,95 @@
               <span class="message-role">{{ msg.role === 'user' ? 'You' : 'Assistant' }}</span>
               <span class="message-time">{{ formatTime(msg.timestamp ?? Date.now()) }}</span>
             </div>
+            
+            <!-- Reasoning section (collapsible) -->
+            <div v-if="msg.reasoning" class="reasoning-section">
+              <button 
+                class="reasoning-toggle" 
+                @click="toggleReasoning(msg)"
+                :disabled="msg.isStreaming"
+              >
+                <span class="toggle-icon">{{ msg.showReasoning ? '▼' : '▶' }}</span>
+                <span class="toggle-label">💭 Reasoning</span>
+                <span v-if="msg.isStreaming" class="streaming-indicator-small"></span>
+              </button>
+              <div v-if="msg.showReasoning" class="reasoning-content">
+                {{ msg.reasoning }}
+              </div>
+            </div>
+            
+            <!-- Tool execution section (show during tool calling) -->
+            <div v-if="msg.toolExecution && !msg.toolExecution.isComplete && msg.toolExecution.toolCalls.length > 0" class="tool-execution-section">
+              <div class="tool-execution-header">
+                <span class="tool-execution-label">🔧 Tool Execution</span>
+                <span class="tool-iteration">Iteration {{ msg.toolExecution.iteration }}/{{ msg.toolExecution.maxIterations }}</span>
+              </div>
+              <div class="tool-calls-list">
+                <div v-for="(call, callIdx) in msg.toolExecution.toolCalls" :key="callIdx" :class="['tool-call-item', call.status]">
+                  <div class="tool-call-header">
+                    <span class="tool-call-icon">
+                      {{ call.status === 'pending' ? '○' : call.status === 'running' ? '●' : call.status === 'success' ? '✓' : '✗' }}
+                    </span>
+                    <span class="tool-call-name">{{ call.name }}</span>
+                    <span v-if="call.status === 'running'" class="tool-spinner"></span>
+                    <span v-if="call.duration_ms" class="tool-call-duration">{{ call.duration_ms.toFixed(1) }}ms</span>
+                    <button 
+                      v-if="call.result && call.status === 'success'" 
+                      class="tool-expand-btn"
+                      @click="toggleToolResult(call)"
+                    >
+                      {{ call.expanded ? '▼' : '▶' }}
+                    </button>
+                  </div>
+                  <div v-if="call.arguments && Object.keys(call.arguments).length > 0" class="tool-call-args">
+                    {{ JSON.stringify(call.arguments) }}
+                  </div>
+                  <div v-if="call.expanded && call.result" class="tool-call-result-full">
+                    {{ call.result }}
+                  </div>
+                  <div v-if="!call.expanded && call.result && call.status === 'success'" class="tool-call-result-preview">
+                    {{ call.result.length > 100 ? call.result.slice(0, 100) + '...' : call.result }}
+                  </div>
+                  <div v-if="call.error && call.status === 'failed'" class="tool-call-error">
+                    {{ call.error }}
+                  </div>
+                </div>
+              </div>
+            </div>
+            
+            <!-- Tool execution summary (after completion) -->
+            <div v-if="msg.toolExecution && msg.toolExecution.isComplete && msg.toolExecution.toolCalls.length > 0" class="tool-execution-summary">
+              <div class="tool-summary-header">
+                <span class="tool-summary-label">🔧 Tools completed: {{ msg.toolExecution.toolCalls.length }} calls in {{ msg.toolExecution.totalTimeMs.toFixed(1) }}ms</span>
+                <button class="tool-expand-btn" @click="toggleToolExecution(msg)">
+                  {{ msg.toolExecutionExpanded ? '▼' : '▶' }}
+                </button>
+              </div>
+              <div v-if="msg.toolExecutionExpanded" class="tool-summary-details">
+                <div v-for="(call, callIdx) in msg.toolExecution.toolCalls" :key="callIdx" :class="['tool-call-item', call.status]">
+                  <div class="tool-call-header">
+                    <span class="tool-call-icon">
+                      {{ call.status === 'success' ? '✓' : '✗' }}
+                    </span>
+                    <span class="tool-call-name">{{ call.name }}</span>
+                    <span v-if="call.duration_ms" class="tool-call-duration">{{ call.duration_ms.toFixed(1) }}ms</span>
+                  </div>
+                  <div v-if="call.arguments && Object.keys(call.arguments).length > 0" class="tool-call-args">
+                    {{ JSON.stringify(call.arguments) }}
+                  </div>
+                  <div v-if="call.result && call.status === 'success'" class="tool-call-result-full">
+                    {{ call.result }}
+                  </div>
+                  <div v-if="call.error && call.status === 'failed'" class="tool-call-error">
+                    {{ call.error }}
+                  </div>
+                </div>
+              </div>
+            </div>
+            
             <div class="message-content">
               {{ msg.content }}
-              <span v-if="msg.isStreaming" class="streaming-indicator"></span>
+              <span v-if="msg.isStreaming && !msg.reasoning" class="streaming-indicator"></span>
             </div>
           </template>
         </div>
@@ -142,7 +228,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, nextTick } from "vue";
-import type { Upstream, ChatMessage } from "../types";
+import type { Upstream, ChatMessage, ToolEvent, ToolExecutionState, ToolCallInfo } from "../types";
 import { getUpstreams, streamChatCompletion } from "../api";
 
 const upstreams = ref<Upstream[]>([]);
@@ -160,6 +246,15 @@ const messagesContainer = ref<HTMLElement | null>(null);
 const isCompacting = ref(false);
 const compactionStep = ref(0);  // 0: not started, 1: analyzing, 2: generating, 3: applying
 const compactionMessage = ref("");
+
+// Tool execution state
+const toolExecutionState = ref<ToolExecutionState>({
+  iteration: 0,
+  maxIterations: 5,
+  toolCalls: [],
+  isComplete: false,
+  totalTimeMs: 0,
+});
 
 // Actual token usage tracking (from API responses)
 const promptTokens = ref(0);
@@ -213,6 +308,61 @@ function buildSummarizationMessages(messagesToSummarize: ChatMessage[]): ChatMes
       content: `Provide a detailed but concise summary of our conversation above. Focus on information that would be helpful for continuing the conversation, including what we did, what we're doing, which files we're working on, and what we're going to do next.\n\nConversation to summarize:\n\n${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${m.content}`).join('\n\n')}`,
     },
   ];
+}
+
+// Tool event handler - updates tool execution state
+function handleToolEvent(event: ToolEvent): void {
+  const state = toolExecutionState.value;
+  
+  if (event.type === "tool_loop_progress") {
+    state.iteration = event.iteration ?? 0;
+    state.maxIterations = event.max_iterations ?? 5;
+  } else if (event.type === "tool_calls_received") {
+    // Add new tool calls to state
+    if (event.tools) {
+      for (const tool of event.tools) {
+        const existingCall = state.toolCalls.find(c => c.name === tool.name);
+        if (!existingCall) {
+          state.toolCalls.push({
+            id: `call_${tool.name}_${state.toolCalls.length}`,
+            name: tool.name,
+            arguments: tool.arguments ?? {},
+            status: "pending",
+            expanded: false,
+          });
+        }
+      }
+    }
+  } else if (event.type === "tool_call_start") {
+    // Mark tool as running
+    const call = state.toolCalls.find(c => c.name === event.name);
+    if (call) {
+      call.status = "running";
+    } else if (event.name) {
+      // Add if not already tracked
+      state.toolCalls.push({
+        id: event.id ?? `call_${event.name}`,
+        name: event.name,
+        arguments: event.arguments ?? {},
+        status: "running",
+        expanded: false,
+      });
+    }
+  } else if (event.type === "tool_call_end") {
+    // Mark tool as complete
+    const call = state.toolCalls.find(c => c.name === event.name);
+    if (call) {
+      call.status = event.success ? "success" : "failed";
+      call.duration_ms = event.duration_ms;
+      call.result = event.result_preview;
+      call.error = event.success ? undefined : event.result_preview;
+    }
+  } else if (event.type === "tool_loop_complete") {
+    state.isComplete = true;
+    state.totalTimeMs = event.total_tool_time_ms ?? 0;
+  }
+  
+  scrollToBottom();
 }
 
 // Compaction: summarize and replace old messages when context is 95% full (like OpenCode)
@@ -336,6 +486,15 @@ async function sendMessage(): Promise<void> {
 
   error.value = "";
 
+  // Reset tool execution state for new message
+  toolExecutionState.value = {
+    iteration: 0,
+    maxIterations: 5,
+    toolCalls: [],
+    isComplete: false,
+    totalTimeMs: 0,
+  };
+
   // Add user message
   const userMsg: ChatMessage = {
     role: "user",
@@ -356,8 +515,12 @@ async function sendMessage(): Promise<void> {
   const assistantMsg: ChatMessage = {
     role: "assistant",
     content: "",
+    reasoning: "",
     timestamp: Date.now(),
     isStreaming: true,
+    showReasoning: true,  // Show reasoning by default when it's being streamed
+    toolExecution: toolExecutionState.value,  // Track tool execution
+    toolExecutionExpanded: false,  // Tool execution details collapsed by default
   };
   messages.value.push(assistantMsg);
   const assistantMsgIndex = messages.value.length - 1;
@@ -371,8 +534,7 @@ async function sendMessage(): Promise<void> {
       selectedModel.value,
       apiMessages,
       (chunk: string) => {
-        // Stream directly into the message at the specific index
-        // This ensures Vue's reactivity detects the change
+        // Stream content directly into the message
         messages.value[assistantMsgIndex].content += chunk;
         scrollToBottom();
       },
@@ -381,14 +543,26 @@ async function sendMessage(): Promise<void> {
         messages.value[assistantMsgIndex].isStreaming = false;
         messages.value[assistantMsgIndex].timestamp = Date.now();
         
+        // Hide reasoning section after streaming if it's empty
+        if (!messages.value[assistantMsgIndex].reasoning) {
+          messages.value[assistantMsgIndex].showReasoning = false;
+        }
+        
+        // Mark tool execution as complete if there were tool calls
+        if (toolExecutionState.value.toolCalls.length > 0) {
+          toolExecutionState.value.isComplete = true;
+          messages.value[assistantMsgIndex].toolExecution = toolExecutionState.value;
+        }
+        
         isStreaming.value = false;
         scrollToBottom();
         
         // Estimate tokens for the new messages
         const userTokens = Math.ceil(userMsg.content.length / 4);
         const assistantTokens = Math.ceil(messages.value[assistantMsgIndex].content.length / 4);
+        const reasoningTokens = Math.ceil((messages.value[assistantMsgIndex].reasoning?.length || 0) / 4);
         promptTokens.value += userTokens;
-        completionTokens.value += assistantTokens;
+        completionTokens.value += assistantTokens + reasoningTokens;
         
         // Trigger compaction AFTER response completes (like OpenCode)
         compactMessages();
@@ -403,6 +577,17 @@ async function sendMessage(): Promise<void> {
         messages.value.pop();
         error.value = err;
         isStreaming.value = false;
+      },
+      (reasoningChunk: string) => {
+        // Stream reasoning content
+        messages.value[assistantMsgIndex].reasoning += reasoningChunk;
+        scrollToBottom();
+      },
+      (toolEvent: ToolEvent) => {
+        // Handle tool execution events
+        handleToolEvent(toolEvent);
+        // Update the message's tool execution state
+        messages.value[assistantMsgIndex].toolExecution = toolExecutionState.value;
       }
     );
   } catch (e) {
@@ -411,6 +596,21 @@ async function sendMessage(): Promise<void> {
     error.value = e instanceof Error ? e.message : "Failed to send message";
     isStreaming.value = false;
   }
+}
+
+// Toggle reasoning visibility
+function toggleReasoning(msg: ChatMessage): void {
+  msg.showReasoning = !msg.showReasoning;
+}
+
+// Toggle tool result expansion
+function toggleToolResult(call: ToolCallInfo): void {
+  call.expanded = !call.expanded;
+}
+
+// Toggle full tool execution details
+function toggleToolExecution(msg: ChatMessage): void {
+  msg.toolExecutionExpanded = !msg.toolExecutionExpanded;
 }
 
 // Clear chat
@@ -715,6 +915,56 @@ onMounted(loadUpstreams);
   word-wrap: break-word;
 }
 
+/* Reasoning section styles */
+.reasoning-section {
+  margin-bottom: 0.5rem;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.reasoning-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 0.5rem 0.75rem;
+  background-color: #f7fafc;
+  border: none;
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: #4a5568;
+  transition: background-color 0.2s;
+}
+
+.reasoning-toggle:hover:not(:disabled) {
+  background-color: #edf2f7;
+}
+
+.reasoning-toggle:disabled {
+  cursor: default;
+}
+
+.toggle-icon {
+  font-size: 0.75rem;
+  color: #718096;
+}
+
+.toggle-label {
+  font-weight: 500;
+}
+
+.reasoning-content {
+  padding: 0.75rem;
+  background-color: #f7fafc;
+  border-top: 1px solid #e2e8f0;
+  font-size: 0.85rem;
+  color: #4a5568;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  line-height: 1.5;
+}
+
 .streaming-indicator {
   display: inline-block;
   width: 8px;
@@ -724,9 +974,201 @@ onMounted(loadUpstreams);
   animation: pulse 1s infinite;
 }
 
+.streaming-indicator-small {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  background-color: #718096;
+  border-radius: 50%;
+  animation: pulse 1s infinite;
+}
+
+/* Tool execution section styles */
+.tool-execution-section {
+  margin-bottom: 0.5rem;
+  background-color: #e6f7ff;
+  border: 1px solid #91d5ff;
+  border-radius: 6px;
+  padding: 0.5rem;
+}
+
+.tool-execution-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.5rem;
+}
+
+.tool-execution-label {
+  font-weight: 600;
+  color: #0050b3;
+  font-size: 0.85rem;
+}
+
+.tool-iteration {
+  color: #69c0ff;
+  font-size: 0.75rem;
+}
+
+.tool-calls-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.tool-call-item {
+  padding: 0.5rem;
+  background-color: white;
+  border-radius: 4px;
+  border-left: 3px solid #91d5ff;
+}
+
+.tool-call-item.pending {
+  border-left-color: #d9d9d9;
+}
+
+.tool-call-item.running {
+  border-left-color: #69c0ff;
+  background-color: #f0faff;
+}
+
+.tool-call-item.success {
+  border-left-color: #52c41a;
+  background-color: #f6ffed;
+}
+
+.tool-call-item.failed {
+  border-left-color: #ff4d4f;
+  background-color: #fff2f0;
+}
+
+.tool-call-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.8rem;
+}
+
+.tool-call-icon {
+  width: 1rem;
+  text-align: center;
+  font-size: 0.7rem;
+}
+
+.tool-call-name {
+  font-weight: 500;
+  color: #262626;
+}
+
+.tool-call-duration {
+  color: #8c8c8c;
+  font-size: 0.7rem;
+}
+
+.tool-call-args {
+  margin-top: 0.25rem;
+  font-size: 0.75rem;
+  color: #595959;
+  background-color: #fafafa;
+  padding: 0.25rem 0.5rem;
+  border-radius: 2px;
+}
+
+.tool-call-result {
+  margin-top: 0.25rem;
+  font-size: 0.75rem;
+  color: #52c41a;
+  background-color: #f6ffed;
+  padding: 0.25rem 0.5rem;
+  border-radius: 2px;
+}
+
+.tool-call-error {
+  margin-top: 0.25rem;
+  font-size: 0.75rem;
+  color: #ff4d4f;
+  background-color: #fff2f0;
+  padding: 0.25rem 0.5rem;
+  border-radius: 2px;
+}
+
+.tool-expand-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 0.7rem;
+  color: #8c8c8c;
+  padding: 0;
+  margin-left: auto;
+}
+
+.tool-expand-btn:hover {
+  color: #0050b3;
+}
+
+.tool-spinner {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border: 2px solid #69c0ff;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+.tool-execution-summary {
+  margin-bottom: 0.25rem;
+  padding: 0.25rem 0.5rem;
+  background-color: #f6ffed;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  color: #52c41a;
+}
+
+.tool-summary-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.tool-summary-label {
+  font-weight: 500;
+}
+
+.tool-summary-details {
+  margin-top: 0.5rem;
+  padding: 0.5rem;
+  background-color: #f6ffed;
+  border-radius: 4px;
+}
+
+.tool-call-result-full {
+  margin-top: 0.25rem;
+  font-size: 0.75rem;
+  color: #52c41a;
+  background-color: #f6ffed;
+  padding: 0.25rem 0.5rem;
+  border-radius: 2px;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+.tool-call-result-preview {
+  margin-top: 0.25rem;
+  font-size: 0.75rem;
+  color: #52c41a;
+  background-color: #f6ffed;
+  padding: 0.25rem 0.5rem;
+  border-radius: 2px;
+}
+
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.3; }
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
 }
 
 .input-area {

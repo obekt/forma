@@ -22,6 +22,8 @@ from forma.proxy import OpenAIProxy
 from forma.storage import Storage
 from forma.forma_db import FormaDatabase, get_db
 from forma.upstream_manager import UpstreamManager
+from forma.tools import ToolExecutor, get_registry
+from forma.tools.executor import ToolExecutionEvent
 
 # Configure logging
 logging.basicConfig(
@@ -39,6 +41,7 @@ extractor: Extractor
 storage: Storage
 db: FormaDatabase
 upstream_manager: UpstreamManager
+tool_executor: ToolExecutor | None = None
 _storage_lock = asyncio.Lock()
 
 
@@ -106,10 +109,74 @@ async def _store_extraction_background(
             logger.error(f"Background storage error: {e}")
 
 
+async def _stream_with_realtime_events(
+    event_queue: asyncio.Queue,
+    model: str,
+) -> Any:
+    """Stream tool execution events in real-time.
+
+    This generator:
+    1. Emits tool execution events from queue immediately as they arrive
+    2. Stops when it receives a "tool_loop_complete" event
+
+    Args:
+        event_queue: Queue receiving tool events in real-time
+        model: Model name for SSE chunks
+
+    Yields:
+        SSE formatted chunks (OpenAI-compatible format)
+    """
+    tool_loop_complete_received = False
+    events_streamed = 0
+
+    # Stream events from queue in real-time until tool_loop_complete event
+    while not tool_loop_complete_received:
+        # Try to get event immediately (non-blocking)
+        try:
+            event = event_queue.get_nowait()
+            logger.debug(f"Streaming event {event.event_type} at {time.time() * 1000:.0f}ms")
+            events_streamed += 1
+        except asyncio.QueueEmpty:
+            # Queue is empty - yield control briefly to let tool executor run
+            await asyncio.sleep(0.001)  # 1ms
+            continue
+
+        # Check if this is the completion event
+        if event.event_type == "tool_loop_complete":
+            tool_loop_complete_received = True
+            logger.info(f"Streamed {events_streamed} tool events in real-time")
+
+        content = event.to_content_delta()
+        if content:
+            # Format as OpenAI SSE chunk
+            chunk = {
+                "id": f"tool_event_{event.event_type}",
+                "object": "chat.completion.chunk",
+                "created": int(event.timestamp / 1000),
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": content},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            yield f"data: {json.dumps(chunk)}\n\n".encode()
+
+            # Send SSE comment to force flush (comments are ignored by clients)
+            # This prevents HTTP buffering from coalescing events
+            yield ": flush\n\n".encode()
+
+            # Force flush by yielding control to event loop
+            # This ensures the SSE chunk is sent immediately, not buffered
+            await asyncio.sleep(0)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> Any:
     """Manage application lifespan."""
-    global proxy, extractor, storage, db, upstream_manager
+    global proxy, extractor, storage, db, upstream_manager, tool_executor
     settings = get_settings()
 
     # Initialize database for web UI and upstreams
@@ -133,6 +200,21 @@ async def lifespan(app: FastAPI) -> Any:
         grafitodb_vector_dim=settings.grafitodb_vector_dim,
         grafitodb_model_cache_path=settings.grafitodb_model_cache_path,
     )
+
+    # Initialize tool executor if tools enabled
+    if settings.tools_enabled:
+        registry = get_registry(storage=storage)
+        tool_executor = ToolExecutor(
+            registry=registry,
+            max_iterations=settings.tools_max_iterations,
+            timeout=settings.tools_timeout,
+        )
+        logger.info(
+            f"Tool execution enabled - max iterations: {settings.tools_max_iterations}, "
+            f"available tools: {registry.get_tool_names()}"
+        )
+    else:
+        tool_executor = None
 
     if db:
         logger.info(f"Request history enabled - max records: {settings.history_max_records}")
@@ -242,15 +324,16 @@ def _get_agent_response(response: dict) -> str:
 @app.post("/v1/chat/completions", response_model=None)
 async def chat_completions(request: Request) -> dict[str, Any] | StreamingResponse:
     """
-    Create chat completion with extraction, retrieval, and RAG context.
+    Create chat completion with extraction, retrieval, RAG context, and tool execution.
 
     Pipeline:
     1. Extract relationships/facts/recipes/queries from messages
     2. Retrieve context from storage using extracted queries
     3. Augment prompt with retrieved context
-    4. Forward to upstream model
-    5. Store extracted data in background (async, fire-and-forget)
-    6. Track request for web UI
+    4. Execute tool loop if tools are provided (server-side tool calling)
+    5. Forward to upstream model (or get final response from tool loop)
+    6. Store extracted data in background (async, fire-and-forget)
+    7. Track request for web UI
     """
     payload = await request.json()
     messages = payload.get("messages", [])
@@ -303,11 +386,17 @@ async def chat_completions(request: Request) -> dict[str, Any] | StreamingRespon
 
             # Step 3: Augment prompt with retrieved context
             if context.get("relationships") or context.get("facts") or context.get("recipes"):
-                context_str = storage.format_context_for_prompt(context)
+                # Get available tools if tools enabled
+                available_tools = None
+                if tool_executor:
+                    available_tools = tool_executor.registry.get_openai_tools()
+
+                context_str = storage.format_context_for_prompt(context, available_tools)
                 logger.info(
                     f"Retrieved context: {len(context['relationships'])} relationships, "
                     f"{len(context['facts'])} facts, {len(context['recipes'])} recipes"
                 )
+                logger.info(f"Context string length: {len(context_str)} chars")
 
                 # Augment first user message with context
                 for msg in messages:
@@ -368,10 +457,292 @@ async def chat_completions(request: Request) -> dict[str, Any] | StreamingRespon
         except Exception as e:
             logger.error(f"Retrieval error: {e}")
 
-    # Step 4: Forward to upstream
-    response = await proxy.chat_completions(payload)
+    # Step 4: Automatically add available tools to request if tools enabled
+    # This allows the upstream model to see and use available tools
+    if tool_executor:
+        registry_tools = tool_executor.registry.get_openai_tools()
+        if registry_tools:
+            # Add tools to payload so upstream model can decide to use them
+            payload["tools"] = registry_tools
+            # Set tool_choice to "auto" if not specified - model decides when to use tools
+            if "tool_choice" not in payload:
+                payload["tool_choice"] = "auto"
+            logger.info(f"Added {len(registry_tools)} available tools to request")
 
-    # Get agent response for tracking
+    # Step 5: Execute tool loop or forward to upstream
+    tools = payload.get("tools", [])
+    tool_choice = payload.get("tool_choice", "auto")
+    stream = payload.get("stream", False)
+    stream_requested = stream  # Track original streaming request
+
+    # Tool execution loop (if tools provided and tools enabled)
+    if tools and tool_executor:
+        # Remove tools from payload for upstream calls (we handle tool execution)
+        payload_without_tools = {
+            k: v for k, v in payload.items() if k not in ("tools", "tool_choice", "stream")
+        }
+
+        # For real-time streaming: use async queue for events
+        if stream_requested:
+            # Create queue for real-time streaming
+            event_queue: asyncio.Queue = asyncio.Queue()
+
+            def realtime_event_callback(event: ToolExecutionEvent) -> None:
+                """Callback to put events into queue for real-time streaming."""
+                event_queue.put_nowait(event)
+                logger.debug(f"Tool event queued: {event.event_type}")
+
+            # Define forward function for tool executor (always non-streaming for tool calls)
+            async def forward_with_tools(
+                messages: list[dict[str, Any]],
+                tools: list[dict[str, Any]] | None = None,
+                tool_choice: str | dict[str, Any] = "auto",
+            ) -> dict[str, Any]:
+                """Forward request to upstream, optionally with tools (non-streaming)."""
+                forward_payload = payload_without_tools.copy()
+                forward_payload["messages"] = messages
+                forward_payload["stream"] = False  # Always non-streaming for tool calls
+
+                if tools:
+                    forward_payload["tools"] = tools
+                    forward_payload["tool_choice"] = tool_choice
+                    # Log tool names being sent to upstream
+                    tool_names = [
+                        t.get("function", {}).get("name", "")
+                        for t in tools
+                        if t.get("type") == "function"
+                    ]
+                    logger.info(f"Forwarding to upstream with tools: {tool_names}")
+                    logger.info(f"Forwarding {len(messages)} messages to upstream")
+
+                    # Log first user message preview
+                    if messages:
+                        for msg in messages:
+                            if msg.get("role") == "user":
+                                content = msg.get("content", "")
+                                preview = content[:200] if len(content) > 200 else content
+                                logger.info(f"First user message preview: {preview}")
+                                break
+
+                return await proxy.chat_completions(forward_payload)
+
+            # Create streaming response generator first (will wait for events from queue)
+            final_payload_template = payload_without_tools.copy()
+            model_name = final_payload_template.get("model", "unknown")
+
+            async def stream_generator_wrapper():
+                """Wrapper that executes tool loop and streams events in parallel."""
+                # Start tool execution in parallel
+                tool_task = asyncio.create_task(
+                    tool_executor.execute_loop(
+                        messages=messages,
+                        tools=tools,
+                        forward_request=forward_with_tools,
+                        tool_choice=tool_choice,
+                        event_callback=realtime_event_callback,
+                    )
+                )
+
+                # Stream events from the real-time generator
+                async for chunk in _stream_with_realtime_events(
+                    event_queue=event_queue,
+                    model=model_name,
+                ):
+                    yield chunk
+
+                # Wait for tool execution to complete and get final messages
+                tool_result = await tool_task
+
+                # Log tool execution
+                if tool_result.has_tool_calls():
+                    logger.info(
+                        f"Tool execution complete: {len(tool_result.tool_calls)} calls, "
+                        f"{tool_result.iterations} iterations, "
+                        f"{tool_result.total_tool_time_ms:.1f}ms total"
+                    )
+                    if tool_result.max_iterations_reached:
+                        logger.warning("Tool execution reached max iterations limit")
+
+                # Now stream the final response with the actual messages
+                if tool_result.final_messages:
+                    final_payload = final_payload_template.copy()
+                    final_payload["messages"] = tool_result.final_messages
+                    final_payload["stream"] = True
+
+                    response = await proxy.chat_completions(final_payload)
+                    if isinstance(response, StreamingResponse):
+                        async for chunk in response.body_iterator:
+                            yield chunk
+                    elif isinstance(response, dict):
+                        # Convert to SSE format
+                        sse_response = response.copy()
+                        if "choices" in sse_response:
+                            for choice in sse_response["choices"]:
+                                if "message" in choice:
+                                    message = choice.pop("message", {})
+                                    choice["delta"] = {"content": message.get("content", "")}
+                                    if message.get("role"):
+                                        choice["delta"]["role"] = message.get("role")
+                        yield f"data: {json.dumps(sse_response)}\n\n".encode()
+                        yield "data: [DONE]\n\n".encode()
+
+                # Store extraction data in background
+                relationships = extraction_result.relationships if extraction_result else []
+                facts = extraction_result.facts if extraction_result else []
+                recipes = extraction_result.recipes if extraction_result else []
+                if relationships or facts or recipes:
+                    asyncio.create_task(_store_extraction_background(relationships, facts, recipes))
+
+                # Record request in database
+                if db:
+                    try:
+                        extraction_prompt_text = (
+                            extraction_result.extraction_prompt if extraction_result else ""
+                        )
+                        request_id = db.record_request(
+                            model=model,
+                            user_prompt=user_prompt,
+                            messages=messages,
+                            extraction_response=extraction_response,
+                            extraction_prompt=extraction_prompt_text,
+                            extraction_ms=extraction_latency,
+                            augmented_prompt=augmented_prompt,
+                            agent_response="",  # Empty for streaming
+                        )
+                        if extraction_result:
+                            db.record_extractions_batch(
+                                request_id=request_id,
+                                relationships=extraction_result.relationships,
+                                facts=extraction_result.facts,
+                                recipes=extraction_result.recipes,
+                            )
+                        if retrieval_results:
+                            db.record_retrievals_batch(
+                                request_id=request_id,
+                                results=retrieval_results,
+                            )
+                    except Exception as e:
+                        logger.error(f"Database recording error: {e}")
+
+            # Return streaming response with headers to disable buffering
+            return StreamingResponse(
+                stream_generator_wrapper(),
+                media_type="text/event-stream",
+                headers={
+                    "X-Accel-Buffering": "no",  # Disable nginx buffering
+                    "Cache-Control": "no-cache",  # Prevent caching
+                    "Connection": "keep-alive",  # Maintain connection
+                },
+            )
+
+        else:
+            # Non-streaming: collect events normally
+            tool_events: list[ToolExecutionEvent] = []
+
+            def event_callback(event: ToolExecutionEvent) -> None:
+                """Callback to collect tool execution events."""
+                tool_events.append(event)
+                logger.debug(f"Tool event: {event.event_type}")
+
+            # Define forward function for tool executor
+            async def forward_with_tools(
+                messages: list[dict[str, Any]],
+                tools: list[dict[str, Any]] | None = None,
+                tool_choice: str | dict[str, Any] = "auto",
+            ) -> dict[str, Any]:
+                """Forward request to upstream, optionally with tools (non-streaming)."""
+                forward_payload = payload_without_tools.copy()
+                forward_payload["messages"] = messages
+                forward_payload["stream"] = False
+
+                if tools:
+                    forward_payload["tools"] = tools
+                    forward_payload["tool_choice"] = tool_choice
+                    tool_names = [
+                        t.get("function", {}).get("name", "")
+                        for t in tools
+                        if t.get("type") == "function"
+                    ]
+                    logger.info(f"Forwarding to upstream with tools: {tool_names}")
+                    logger.info(f"Forwarding {len(messages)} messages to upstream")
+
+                return await proxy.chat_completions(forward_payload)
+
+            # Execute tool loop
+            logger.info(f"Executing tool loop (streaming=False)")
+            tool_result = await tool_executor.execute_loop(
+                messages=messages,
+                tools=tools,
+                forward_request=forward_with_tools,
+                tool_choice=tool_choice,
+                event_callback=event_callback,
+            )
+
+            # Log tool execution
+            if tool_result.has_tool_calls():
+                logger.info(
+                    f"Tool execution complete: {len(tool_result.tool_calls)} calls, "
+                    f"{tool_result.iterations} iterations, "
+                    f"{tool_result.total_tool_time_ms:.1f}ms total"
+                )
+                if tool_result.max_iterations_reached:
+                    logger.warning("Tool execution reached max iterations limit")
+
+            # Non-streaming response - continue to Step 6 for recording
+            response = tool_result.response
+    else:
+        # Normal forward without tool execution
+        response = await proxy.chat_completions(payload)
+        # If streaming and no tools, response is StreamingResponse - return directly
+        if isinstance(response, StreamingResponse):
+            # Record request without agent_response for streaming
+            if db:
+                try:
+                    extraction_prompt_text = (
+                        extraction_result.extraction_prompt if extraction_result else ""
+                    )
+                    request_id = db.record_request(
+                        model=model,
+                        user_prompt=user_prompt,
+                        messages=messages,
+                        extraction_response=extraction_response,
+                        extraction_prompt=extraction_prompt_text,
+                        extraction_ms=extraction_latency,
+                        augmented_prompt=augmented_prompt,
+                        agent_response="",  # Empty for streaming
+                    )
+
+                    if extraction_result:
+                        db.record_extractions_batch(
+                            request_id=request_id,
+                            relationships=extraction_result.relationships,
+                            facts=extraction_result.facts,
+                            recipes=extraction_result.recipes,
+                        )
+
+                    if retrieval_results:
+                        db.record_retrievals_batch(
+                            request_id=request_id,
+                            results=retrieval_results,
+                        )
+                except Exception as e:
+                    logger.error(f"Database recording error: {e}")
+
+            relationships = extraction_result.relationships if extraction_result else []
+            facts = extraction_result.facts if extraction_result else []
+            recipes = extraction_result.recipes if extraction_result else []
+            if relationships or facts or recipes:
+                asyncio.create_task(
+                    _store_extraction_background(
+                        relationships,
+                        facts,
+                        recipes,
+                    )
+                )
+
+            return response  # Return StreamingResponse directly
+
+    # Get agent response for tracking (only for non-streaming responses)
     agent_response = ""
     if isinstance(response, dict):
         agent_response = _get_agent_response(response)

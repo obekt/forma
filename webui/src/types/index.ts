@@ -105,9 +105,63 @@ export interface UpdateUpstreamRequest {
 export interface ChatMessage {
   role: "user" | "assistant" | "system";
   content: string;
+  reasoning?: string;  // Reasoning content (separate from main content)
   timestamp?: number;
   isStreaming?: boolean;  // For messages being streamed (assistant responses or compaction summaries)
   isCompacting?: boolean; // For compaction progress messages
+  showReasoning?: boolean; // Whether reasoning section is expanded (UI state)
+  // Tool execution state
+  toolExecution?: ToolExecutionState;
+  toolExecutionExpanded?: boolean; // Whether tool execution details are expanded (UI state)
+}
+
+// Tool event types
+export type ToolEventType = 
+  | "tool_loop_progress"
+  | "tool_calls_received"
+  | "tool_call_start"
+  | "tool_call_end"
+  | "tool_loop_complete";
+
+export interface ToolEvent {
+  type: ToolEventType;
+  timestamp: number;
+  // For tool_loop_progress
+  iteration?: number;
+  max_iterations?: number;
+  // For tool_calls_received
+  count?: number;
+  tools?: { name: string; arguments: Record<string, unknown> }[];
+  // For tool_call_start
+  id?: string;
+  name?: string;
+  arguments?: Record<string, unknown>;
+  // For tool_call_end
+  success?: boolean;
+  duration_ms?: number;
+  result_preview?: string;
+  // For tool_loop_complete
+  total_tool_calls?: number;
+  total_tool_time_ms?: number;
+}
+
+export interface ToolCallInfo {
+  id: string;
+  name: string;
+  arguments: Record<string, unknown>;
+  status: "pending" | "running" | "success" | "failed";
+  duration_ms?: number;
+  result?: string;
+  error?: string;
+  expanded?: boolean;  // Whether result is expanded (UI state)
+}
+
+export interface ToolExecutionState {
+  iteration: number;
+  maxIterations: number;
+  toolCalls: ToolCallInfo[];
+  isComplete: boolean;
+  totalTimeMs: number;
 }
 
 export interface ChatCompletionRequest {
@@ -128,6 +182,7 @@ export interface ChatCompletionChunk {
     delta: {
       role?: string;
       content?: string;
+      reasoning_content?: string;  // DeepSeek R1 and similar models output reasoning separately
     };
     finish_reason: string | null;
   }[];
